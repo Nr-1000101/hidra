@@ -1,6 +1,8 @@
 # dataset
 the dataset can be found [here](https://drive.google.com/drive/folders/1cUiWKWdU7CQoh67a-ucyb-Na1lSwWjKH?usp=drive_link). it's comprsided of ~3.9 million small molecular structures (atom types, coordinates and an isomer dictionary), their SMILES and SELFIES descriptors, symmetry point groups and various other geometry, like dimensionality, angles between ring planes, etc. the data is structured into 8 (4 structure, 4 feature) .h5 files containing entries on a bit less than 1 million molecules each.
 
+![example_output.jpg](example_output.jpg)
+
 ![dataset_info.png](dataset_info.jpg)
 
 ![molecule_atom_type_distribution.png](molecule_atom_type_distribution.png)
