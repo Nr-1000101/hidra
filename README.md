@@ -1,2 +1,2 @@
-# transformol
-A transformer model to speed up DFT calculations
+# molfortrans
+A transformer model aimed at molecular geometry
