@@ -1,2 +1,2 @@
 # HIDRA
-this github repository contains all the accompanying information and scripts used to train the HIDRA - HIerarchical DFT accuracy transformer model to Reconstruct Atomic geometry - and construct the dataset that it was trained on
+this github repository contains all the accompanying information and scripts used to train the HIDRA - HIerarchical DFT accuracy transformer model to Reconstruct Atomic geometry. Additionally, all the scripts to construct the dataset that HIDRA was trained on, some information about it and the link to the dataset itself are can be found in [dataset]()
