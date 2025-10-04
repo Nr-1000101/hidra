@@ -12,7 +12,7 @@ the dataset can be found [here](https://drive.google.com/drive/folders/1cUiWKWdU
 
 <p align="center">
   <picture>
-    <source srcset="dataset_info_dark.jpg" media="(prefers-color-scheme: dark)">
+    <source srcset="dataset_info_dark.png" media="(prefers-color-scheme: dark)">
     <img src="dataset_info.jpg" alt="dataset info"/>
   </picture>
 </p>
