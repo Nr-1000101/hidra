@@ -4,6 +4,7 @@ the dataset can be found [here](https://drive.google.com/drive/folders/1cUiWKWdU
 - their SMILES and SELFIES descriptors
 - chirality, symmetry planes counts and symmetry point groups
 - dimensionality, numbers of rings, their flatness standard deviations and angles between ring planes.
+
 the data is structured into 8 (4 structure, 4 feature) .h5 files containing entries on a bit less than 1 million molecules each.
 
 <p align="center">
