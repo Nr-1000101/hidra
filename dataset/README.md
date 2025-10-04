@@ -12,28 +12,28 @@ the data is structured into 8 (4 structure, 4 feature) .h5 files containing entr
     <!-- Dark mode version -->
     <source srcset="images/example_output_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <!-- Light mode version (fallback) -->
-    <img src="example_output.png" alt="example output"/>
+    <img src="images/example_output.png" alt="example output"/>
   </picture>
 </p>
 
 <p align="center">
   <picture>
-    <source srcset="dataset_info_dark_no_bg.png" media="(prefers-color-scheme: dark)">
-    <img src="dataset_info.jpg" alt="dataset info"/>
+    <source srcset="images/dataset_info_dark_no_bg.png" media="(prefers-color-scheme: dark)">
+    <img src="images/dataset_info.jpg" alt="dataset info"/>
   </picture>
 </p>
 
 <p align="center">
   <picture>
-    <source srcset="molecule_atom_type_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
-    <img src="molecule_atom_type_distribution.png" alt="molecule atom type distribution"/>
+    <source srcset="images/molecule_atom_type_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
+    <img src="images/molecule_atom_type_distribution.png" alt="molecule atom type distribution"/>
   </picture>
 </p>
 
 <p align="center">
   <picture>
-    <source srcset="molecule_point_group_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
-    <img src="molecule_point_group_distribution.png" alt="molecule point group distribution"/>
+    <source srcset="images/molecule_point_group_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
+    <img src="images/molecule_point_group_distribution.png" alt="molecule point group distribution"/>
   </picture>
 </p>
 
