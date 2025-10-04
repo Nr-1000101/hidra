@@ -10,7 +10,7 @@ the data is structured into 8 (4 structure, 4 feature) .h5 files containing entr
 <p align="center">
   <picture>
     <!-- Dark mode version -->
-    <source srcset="example_output_dark_no_bg.png" media="(prefers-color-scheme: dark)">
+    <source srcset="images/example_output_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <!-- Light mode version (fallback) -->
     <img src="example_output.png" alt="example output"/>
   </picture>
