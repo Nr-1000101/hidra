@@ -4,7 +4,7 @@ the dataset can be found [here](https://drive.google.com/drive/folders/1cUiWKWdU
 <p align="center">
   <picture>
     <!-- Dark mode version -->
-    <source srcset="example_output_dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="example_output_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <!-- Light mode version (fallback) -->
     <img src="example_output.png" alt="example output"/>
   </picture>
@@ -12,21 +12,21 @@ the dataset can be found [here](https://drive.google.com/drive/folders/1cUiWKWdU
 
 <p align="center">
   <picture>
-    <source srcset="dataset_info_dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="dataset_info_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <img src="dataset_info.jpg" alt="dataset info"/>
   </picture>
 </p>
 
 <p align="center">
   <picture>
-    <source srcset="molecule_atom_type_distribution_dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="molecule_atom_type_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <img src="molecule_atom_type_distribution.png" alt="molecule atom type distribution"/>
   </picture>
 </p>
 
 <p align="center">
   <picture>
-    <source srcset="molecule_point_group_distribution_dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="molecule_point_group_distribution_dark_no_bg.png" media="(prefers-color-scheme: dark)">
     <img src="molecule_point_group_distribution.png" alt="molecule point group distribution"/>
   </picture>
 </p>
