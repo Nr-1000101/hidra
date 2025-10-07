@@ -1,0 +1,12 @@
+# Ignore large files in mol3d_data
+mol3d_data/*.h5
+
+# Ignore all temporary files
+*.log
+*.tmp
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# Ignore Claude files
+*.md
