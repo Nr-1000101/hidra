@@ -78,6 +78,8 @@ class LabelEncoder:
     
     def inverse_transform(self, property_name: str, idx: int) -> str:
         """Convert index back to label."""
+        if property_name not in self.idx_to_label:
+            return "unknown"
         return self.idx_to_label[property_name].get(idx, "unknown")
     
     def get_num_classes(self, property_name: str) -> int:
@@ -141,7 +143,7 @@ SMILES_REGEX = re.compile(
     r"""([A-Z][a-z]?               # single and multi-letter atoms
         | \[ [^\]]+ \]             # bracketed expressions
         | @@?                      # stereochemistry @ / @@
-        | =|#|\+|-|/|\\            # bonds
+        | [=#\+/\\-]               # bonds (hyphen at end to avoid range)
         | \(|\)|\.|\*              # parentheses, dot, wildcard
         | \d                       # single-digit ring closures
         | %\d{2}                   # two-digit ring closures
