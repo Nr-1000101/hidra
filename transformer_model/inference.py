@@ -38,7 +38,7 @@ class MolecularPropertyPredictor:
         self.vocab_size = self.checkpoint['vocab_size']
         self.max_len = self.checkpoint['max_len']
         self.d_model = self.checkpoint['d_model']
-        self.n_initial_blocks = self.checkpoint['n_initial_blocks']
+        self.n_encoder_blocks = self.checkpoint['n_encoder_blocks']
         self.property_configs = self.checkpoint['property_configs']
         self.label_encoder = self.checkpoint['label_encoder']
 
@@ -56,9 +56,9 @@ class MolecularPropertyPredictor:
         self.model = HierarchicalTransformer(
             vocab_size=self.vocab_size,
             property_configs=self.property_configs,
+            n_encoder_blocks=self.n_encoder_blocks,
             max_len=self.max_len,
             d_model=self.d_model,
-            n_initial_blocks=self.n_initial_blocks,
             pad_idx=self.tokenizer.token_to_id["<pad>"]
         )
         self.model.load_state_dict(self.checkpoint['model_state_dict'])
@@ -237,21 +237,21 @@ class MolecularPropertyPredictor:
         print(f"Vocabulary size: {self.vocab_size}")
         print(f"Max sequence length: {self.max_len}")
         print(f"Model dimension: {self.d_model}")
-        print(f"Initial encoder blocks: {self.n_initial_blocks}")
+        print(f"Encoder blocks: {self.n_encoder_blocks}")
         print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"\nPredicted properties ({len(self.property_configs)}):")
         for i, cfg in enumerate(self.property_configs, 1):
             task = cfg['task']
-            n_blocks = cfg.get('n_blocks', 'N/A')
+            attach_block = cfg.get('attach_at_block', 'N/A')
             cross_attn = cfg.get('use_cross_attention', False)
 
             if task == 'classification':
                 num_classes = cfg.get('num_classes', 'N/A')
                 print(f"  {i}. {cfg['name']}: {task} ({num_classes} classes), "
-                      f"{n_blocks} blocks, cross-attn={cross_attn}")
+                      f"attach@block{attach_block}, cross-attn={cross_attn}")
             else:
                 print(f"  {i}. {cfg['name']}: {task}, "
-                      f"{n_blocks} blocks, cross-attn={cross_attn}")
+                      f"attach@block{attach_block}, cross-attn={cross_attn}")
         print("=" * 60)
 
     def print_predictions(self, predictions: Dict[str, Dict[str, Any]], show_all_probs: bool = False):

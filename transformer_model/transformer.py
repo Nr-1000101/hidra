@@ -2,17 +2,24 @@
 # coding: utf-8
 
 """
-Symmetry Transformer: Hierarchical Transformer for predicting molecular geometry
-from SMILES or SELFIES strings, loading data from HDF5 (.h5) files.
+HIDRA: Flexible Transformer for predicting molecular properties from SMILES/SELFIES.
 
 Architecture:
-    1. Shared initial encoder blocks process input sequence (configurable via n_initial_blocks)
-    2. Hierarchical property predictions (fully configurable):
-       - Each property optionally cross-attends to previous predictions (per-property configurable)
-       - Processes with its own encoder blocks (configurable number per property)
-       - Optionally embeds prediction for next property (per-property configurable)
-    3. Default properties flow: dimension → rings → chirality → symmetry → point_group → planarity → angles
-    4. User can select any subset of properties via --properties argument
+    1. Token + positional embeddings
+    2. Stack of N encoder blocks (shared across all predictions)
+    3. Prediction heads attach to specific encoder blocks:
+       - Multiple heads can attach to the same block (parallel multi-task)
+       - Heads can attach to different blocks (hierarchical prediction)
+       - Each head is a lightweight linear layer (classification or regression)
+    4. Optional cross-attention feedback:
+       - Heads can embed their predictions
+       - Subsequent encoder blocks cross-attend to prediction embeddings
+       - Enables information flow from earlier predictions to later encoders
+
+Configuration modes:
+    - Default: N blocks → all heads at last block (standard multi-task)
+    - Parallel: N blocks → all heads at same block (shared representation)
+    - Hierarchical: Heads at different blocks with cross-attention feedback
 """
 import argparse
 import random
@@ -513,57 +520,34 @@ class CrossAttention(nn.Module):
         x = self.norm(x)
         return x
 
-# --- Property Block ---
-class PropertyBlock(nn.Module):
-    """Property prediction block with encoder layers, cross-attention, and prediction head.
+# --- Property Head ---
+class PropertyHead(nn.Module):
+    """Prediction head for a single property with optional embedding for cross-attention.
 
     Architecture:
-        1. Cross-attention to previous property (if use_cross_attention=True)
-        2. N transformer encoder layers
-        3. Prediction head (classification or regression)
-        4. Prediction embedding for next property (if provide_embeddings=True)
+        1. Prediction head (classification or regression)
+        2. Optional prediction embedding for cross-attention feedback
     """
 
     def __init__(
         self,
         d_model: int = 512,
-        nhead: int = 8,
-        num_layers: int = 2,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
         task: str = "classification",
         num_classes: Optional[int] = None,
-        use_cross_attention: bool = True,
-        provide_embeddings: bool = True
+        use_cross_attention: bool = False
     ):
-        """Initialize property block.
+        """Initialize property head.
 
         Args:
             d_model: Model dimension
-            nhead: Number of attention heads
-            num_layers: Number of encoder layers in this block
-            dim_feedforward: FFN dimension
-            dropout: Dropout probability
             task: "classification" or "regression"
             num_classes: Number of classes (for classification)
-            use_cross_attention: Whether to use cross-attention to previous properties
-            provide_embeddings: Whether to generate embeddings for next properties
+            use_cross_attention: Whether to generate embeddings for cross-attention feedback
         """
         super().__init__()
         self.task = task
         self.d_model = d_model
         self.use_cross_attention = use_cross_attention
-        self.provide_embeddings = provide_embeddings
-
-        # Cross-attention for previous property conditioning (optional)
-        if use_cross_attention:
-            self.cross_attn = CrossAttention(d_model, nhead, dropout)
-
-        # Encoder layers for processing after cross-attention
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
         # Prediction head
         if task == "classification":
@@ -574,8 +558,8 @@ class PropertyBlock(nn.Module):
         else:
             raise ValueError("task must be 'classification' or 'regression'")
 
-        # Embed prediction for next property (optional)
-        if provide_embeddings:
+        # Embed prediction for cross-attention (optional)
+        if use_cross_attention:
             if task == "classification":
                 self.pred_embedding = nn.Embedding(num_classes, d_model)
             else:
@@ -583,37 +567,24 @@ class PropertyBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        attn_mask: torch.Tensor,
-        prev_memory: Optional[torch.Tensor] = None,
-        prev_memory_mask: Optional[torch.Tensor] = None
+        x: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass.
 
         Args:
             x: Input tensor (batch_size, seq_len, d_model)
-            attn_mask: Attention mask (batch_size, seq_len)
-            prev_memory: Previous property embeddings
-            prev_memory_mask: Mask for previous property
 
         Returns:
             logits: Prediction logits
-            pred_embedding: Embedded prediction for next property (None if provide_embeddings=False)
+            pred_embedding: Embedded prediction for cross-attention (None if use_cross_attention=False)
         """
-        # Apply cross-attention if enabled and previous property exists
-        if self.use_cross_attention and prev_memory is not None:
-            x = self.cross_attn(x, prev_memory, memory_mask=~prev_memory_mask.bool())
-
-        # Process with encoder layers
-        h = self.encoder(x, src_key_padding_mask=~attn_mask.bool())
-
         # Pool for prediction (use CLS token = first token)
-        pooled = h[:, 0]  # (batch_size, d_model)
+        pooled = x[:, 0]  # (batch_size, d_model)
         logits = self.head(pooled)
 
-        # Embed prediction for next property (if enabled)
+        # Embed prediction for cross-attention (if enabled)
         pred_emb = None
-        if self.provide_embeddings:
+        if self.use_cross_attention:
             if self.task == "classification":
                 pred_idx = logits.argmax(dim=-1)  # (batch_size,)
                 pred_emb = self.pred_embedding(pred_idx)  # (batch_size, d_model)
@@ -621,44 +592,43 @@ class PropertyBlock(nn.Module):
                 pred_emb = self.pred_embedding(logits)  # (batch_size, d_model)
 
             # Expand to sequence length for cross-attention
-            pred_emb = pred_emb.unsqueeze(1).expand(-1, h.size(1), -1)  # (batch_size, seq_len, d_model)
+            pred_emb = pred_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (batch_size, seq_len, d_model)
 
         return logits, pred_emb
 
 
 # --- Hierarchical Transformer ---
 class HierarchicalTransformer(nn.Module):
-    """Hierarchical Transformer for molecular property prediction.
+    """Flexible Transformer for molecular property prediction with attachment points.
 
     Architecture:
         1. Token + positional embeddings
-        2. N initial shared encoder blocks (configurable via n_initial_blocks)
-        3. Flexible property predictions (configurable per property):
-           - Optional cross-attention to previous predictions (use_cross_attention flag)
-           - Configurable number of encoder blocks per property (n_blocks)
-           - Optional prediction embedding generation for next properties (provide_embeddings flag)
-        4. Properties are fully configurable: select any subset via property_configs
+        2. Stack of N encoder blocks (configurable)
+        3. Prediction heads attached to specific encoder blocks:
+           - Multiple heads can attach to the same block
+           - Heads can attach to any block (0 to N-1)
+           - Each head optionally embeds prediction for cross-attention feedback
+        4. Optional cross-attention from prediction embeddings to subsequent blocks
 
-    Configurability:
-        - Which properties to predict (via property_configs list)
-        - Cross-attention per property (via use_cross_attention in config)
-        - Number of blocks per property (via n_blocks in config)
-        - Embedding generation per property (via provide_embeddings in config)
+    Example configurations:
+        - Default: N=4 blocks, 1 head attached to block 3 (last)
+        - Parallel: N=2 blocks, 7 heads attached to block 1 (all parallel)
+        - Hierarchical: Head1@block0 (cross-attn) → Head2@block1 (cross-attn) → Head3@block2
     """
 
     def __init__(
         self,
         vocab_size: int,
         property_configs: List[Dict],
+        n_encoder_blocks: int = 4,
         max_len: int = 512,
         d_model: int = 512,
         nhead: int = 8,
-        n_initial_blocks: int = 4,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         pad_idx: int = 0
     ):
-        """Initialize hierarchical transformer.
+        """Initialize flexible transformer.
 
         Args:
             vocab_size: Size of token vocabulary
@@ -668,67 +638,94 @@ class HierarchicalTransformer(nn.Module):
                         "name": "dimension",
                         "task": "classification",
                         "num_classes": 5,
-                        "n_blocks": 2,
-                        "use_cross_attention": True,
-                        "provide_embeddings": True
+                        "attach_at_block": 3,  # Attach head to block 3 output
+                        "use_cross_attention": True  # Embed prediction and feed back
                     },
                     {
                         "name": "ring_count",
-                        "task": "regression",
-                        "n_blocks": 1,
-                        "use_cross_attention": False,
-                        "provide_embeddings": False
+                        "task": "classification",
+                        "num_classes": 7,
+                        "attach_at_block": 3,  # Attach to same block as dimension
+                        "use_cross_attention": False
                     },
                     ...
                 ]
+            n_encoder_blocks: Total number of encoder blocks in stack
             max_len: Maximum sequence length
             d_model: Model dimension
             nhead: Number of attention heads
-            n_initial_blocks: Number of shared encoder blocks before properties
             dim_feedforward: FFN dimension
             dropout: Dropout probability
             pad_idx: Padding token index
         """
         super().__init__()
         self.d_model = d_model
-        self.property_names = [cfg["name"] for cfg in property_configs]
+        self.nhead = nhead
+        self.n_encoder_blocks = n_encoder_blocks
+
+        # Validate n_encoder_blocks
+        if n_encoder_blocks < 1:
+            raise ValueError(f"n_encoder_blocks must be >= 1, got {n_encoder_blocks}")
 
         # Token embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.pos_enc = LearnedPositionalEncoding(d_model, max_len)
 
-        # Initial shared encoder
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, batch_first=True
-        )
-        self.initial_encoder = nn.TransformerEncoder(enc_layer, num_layers=n_initial_blocks)
+        # Create stack of encoder blocks (individual layers for flexible attachment)
+        self.encoder_blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model, nhead, dim_feedforward, dropout, batch_first=True
+            )
+            for _ in range(n_encoder_blocks)
+        ])
 
-        # Property blocks
-        self.properties = nn.ModuleList([
-            PropertyBlock(
+        # Create cross-attention modules for each encoder block (except first)
+        self.cross_attn_modules = nn.ModuleList([
+            CrossAttention(d_model, nhead, dropout) if i > 0 else None
+            for i in range(n_encoder_blocks)
+        ])
+
+        # Create property heads
+        self.property_heads = nn.ModuleDict()
+        self.property_configs = {}
+
+        for cfg in property_configs:
+            prop_name = cfg["name"]
+            self.property_configs[prop_name] = cfg
+
+            self.property_heads[prop_name] = PropertyHead(
                 d_model=d_model,
-                nhead=nhead,
-                num_layers=cfg.get("n_blocks", 2),
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
                 task=cfg["task"],
                 num_classes=cfg.get("num_classes"),
-                use_cross_attention=cfg.get("use_cross_attention", True),
-                provide_embeddings=cfg.get("provide_embeddings", True)
+                use_cross_attention=cfg.get("use_cross_attention", False)
             )
-            for cfg in property_configs
-        ])
+
+        # Group properties by attachment block for efficient processing
+        self.attachment_map = {}  # block_idx -> [property_names]
+        for cfg in property_configs:
+            attach_block = cfg.get("attach_at_block", n_encoder_blocks - 1)
+
+            # Validate attachment block is within valid range
+            if attach_block < 0 or attach_block >= n_encoder_blocks:
+                raise ValueError(
+                    f"Property '{cfg['name']}' has attach_at_block={attach_block}, "
+                    f"but must be in range [0, {n_encoder_blocks - 1}]"
+                )
+
+            if attach_block not in self.attachment_map:
+                self.attachment_map[attach_block] = []
+            self.attachment_map[attach_block].append(cfg["name"])
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass through hierarchical network.
+        """Forward pass through encoder stack with head attachments.
 
         Args:
             input_ids: Token IDs (batch_size, seq_len)
-            attention_mask: Attention mask (batch_size, seq_len)
+            attention_mask: Attention mask (batch_size, seq_len) where 1=valid, 0=padding
 
         Returns:
             Dictionary of predictions for each property (keyed by property name)
@@ -737,27 +734,41 @@ class HierarchicalTransformer(nn.Module):
         x = self.token_emb(input_ids)
         x = self.pos_enc(x)
 
-        # Initial shared encoding
-        x = self.initial_encoder(x, src_key_padding_mask=~attention_mask.bool())
-
-        # Hierarchical property predictions
+        # Track outputs and cross-attention memories
         outputs = {}
-        prev_memory = None
-        prev_mask = None
+        cross_attn_memories = []  # List of (pred_embedding, mask) tuples for cross-attention
 
-        for i, (block, prop_name) in enumerate(zip(self.properties, self.property_names)):
-            logits, pred_emb = block(
-                x,
-                attention_mask,
-                prev_memory=prev_memory,
-                prev_memory_mask=prev_mask
-            )
-            outputs[prop_name] = logits
+        # Process encoder blocks sequentially
+        for block_idx, encoder_block in enumerate(self.encoder_blocks):
 
-            # Update memory for next property (only if embeddings are provided)
-            if pred_emb is not None:
-                prev_memory = pred_emb
-                prev_mask = attention_mask
+            # Apply cross-attention from prediction embeddings generated so far
+            if block_idx > 0 and len(cross_attn_memories) > 0 and self.cross_attn_modules[block_idx] is not None:
+                # Concatenate all prediction embeddings along sequence dimension
+                # Each pred_emb has shape (batch, seq_len, d_model)
+                all_memories = torch.cat([mem for mem, _ in cross_attn_memories], dim=1)
+                # All masks have shape (batch, seq_len) - concatenate to (batch, n_preds * seq_len)
+                all_masks = torch.cat([mask for _, mask in cross_attn_memories], dim=1)
+
+                # Cross-attend from current representation to all previous predictions
+                x = self.cross_attn_modules[block_idx](
+                    x,
+                    all_memories,
+                    memory_mask=~all_masks.bool()  # CrossAttention expects True for positions to mask out
+                )
+
+            # Process through encoder block (self-attention + FFN)
+            x = encoder_block(x, src_key_padding_mask=~attention_mask.bool())
+
+            # Apply any prediction heads attached at this block
+            if block_idx in self.attachment_map:
+                for prop_name in self.attachment_map[block_idx]:
+                    # Generate prediction for this property
+                    logits, pred_emb = self.property_heads[prop_name](x)
+                    outputs[prop_name] = logits
+
+                    # Store prediction embedding for cross-attention to future blocks (if enabled)
+                    if pred_emb is not None:
+                        cross_attn_memories.append((pred_emb, attention_mask))
 
         return outputs
 
@@ -899,8 +910,8 @@ def evaluate(
 
 # --- Main Training Script ---
 def main():
-    """Main training loop."""
-    parser = argparse.ArgumentParser(description="Train Hierarchical Transformer for molecular properties")
+    """Main training loop with flexible attachment point architecture."""
+    parser = argparse.ArgumentParser(description="Train Flexible Transformer for molecular property prediction")
     parser.add_argument("--mol_files", nargs='+', required=True, help="HDF5 files with molecules")
     parser.add_argument("--feat_files", nargs='+', required=True, help="HDF5 files with features")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
@@ -908,7 +919,7 @@ def main():
     parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
-    parser.add_argument("--n_initial_blocks", type=int, default=4, help="Number of initial shared encoder blocks")
+    parser.add_argument("--n_encoder_blocks", type=int, default=4, help="Number of encoder blocks in the stack")
     parser.add_argument("--mode", choices=["smiles", "selfies"], default="smiles", help="Input format")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument(
@@ -919,16 +930,21 @@ def main():
         help="Properties to predict (subset of: dimension, ring_count, chirality, n_symmetry_planes, point_group, planar_fit_error, ring_plane_angles)"
     )
     parser.add_argument(
-        "--use_cross_attention",
-        nargs='+',
+        "--attach_at_block",
+        type=int,
         default=None,
-        help="Properties that should use cross-attention (default: all use cross-attention except first)"
+        help="Default block index to attach prediction heads (default: last block). Can be overridden per property."
     )
     parser.add_argument(
-        "--n_blocks_per_property",
-        type=int,
-        default=2,
-        help="Number of encoder blocks per property (default: 2)"
+        "--property_attach_blocks",
+        nargs='*',
+        default=[],
+        help="Per-property attachment blocks as 'property:block' pairs (e.g., dimension:0 ring_count:1). Overrides --attach_at_block for specified properties."
+    )
+    parser.add_argument(
+        "--enable_cross_attention",
+        action="store_true",
+        help="Enable cross-attention feedback from prediction embeddings (default: False)"
     )
     parser.add_argument(
         "--max_molecules",
@@ -1056,40 +1072,64 @@ def main():
         if prop not in all_property_info:
             raise ValueError(f"Unknown property: {prop}. Valid properties: {list(all_property_info.keys())}")
 
-    # Determine which properties use cross-attention
-    if args.use_cross_attention is None:
-        # Default: all properties except the first use cross-attention
-        use_cross_attention_set = set(args.properties[1:])
-    else:
-        use_cross_attention_set = set(args.use_cross_attention)
+    # Determine default attachment block (last block if not specified)
+    # Block indices are 0-indexed, so last block is n_encoder_blocks - 1
+    default_attach_block = args.attach_at_block if args.attach_at_block is not None else args.n_encoder_blocks - 1
+
+    # Parse per-property attachment blocks
+    property_attach_map = {}
+    for mapping in args.property_attach_blocks:
+        if ':' not in mapping:
+            raise ValueError(f"Invalid property_attach_blocks format: '{mapping}'. Expected 'property:block' (e.g., dimension:0)")
+        prop_name, block_str = mapping.split(':', 1)
+        try:
+            block_idx = int(block_str)
+        except ValueError:
+            raise ValueError(f"Invalid block index in '{mapping}'. Expected integer after colon.")
+
+        # Validate block index is within valid range
+        if block_idx < 0 or block_idx >= args.n_encoder_blocks:
+            raise ValueError(
+                f"Property '{prop_name}' has attach block {block_idx}, "
+                f"but must be in range [0, {args.n_encoder_blocks - 1}]"
+            )
+
+        property_attach_map[prop_name] = block_idx
 
     # Build property configs for selected properties
+    # Each config specifies: task type, attachment point, cross-attention flag, num_classes (if classification)
     property_configs = []
     for i, prop_name in enumerate(args.properties):
         prop_info = all_property_info[prop_name]
+
+        # Use per-property attachment if specified, otherwise use default
+        attach_block = property_attach_map.get(prop_name, default_attach_block)
+
         config = {
             "name": prop_name,
-            "task": prop_info["task"],
-            "n_blocks": args.n_blocks_per_property,
-            "use_cross_attention": prop_name in use_cross_attention_set,
-            "provide_embeddings": i < len(args.properties) - 1  # Last property doesn't need to provide embeddings
+            "task": prop_info["task"],  # "classification" or "regression"
+            "attach_at_block": attach_block,  # Which encoder block output to attach head to
+            "use_cross_attention": args.enable_cross_attention  # Whether to embed prediction for feedback
         }
         if "num_classes" in prop_info:
-            config["num_classes"] = prop_info["num_classes"]
+            config["num_classes"] = prop_info["num_classes"]  # Only for classification tasks
         property_configs.append(config)
 
     print(f"\nTraining properties: {args.properties}")
-    print(f"Properties using cross-attention: {sorted(use_cross_attention_set & set(args.properties))}")
-    print(f"Blocks per property: {args.n_blocks_per_property}")
+    print(f"Encoder blocks: {args.n_encoder_blocks}")
+    print(f"Default attachment block: {default_attach_block}")
+    if property_attach_map:
+        print(f"Per-property attachments: {property_attach_map}")
+    print(f"Cross-attention enabled: {args.enable_cross_attention}")
 
     # Create model
     model = HierarchicalTransformer(
         vocab_size=tokenizer.vocab_size,
         property_configs=property_configs,
+        n_encoder_blocks=args.n_encoder_blocks,
         max_len=args.max_len,
         d_model=args.d_model,
         nhead=8,
-        n_initial_blocks=args.n_initial_blocks,
         pad_idx=tokenizer.token_to_id["<pad>"]
     )
     model.to(device)
@@ -1117,7 +1157,7 @@ def main():
                 "vocab_size": tokenizer.vocab_size,
                 "max_len": args.max_len,
                 "d_model": args.d_model,
-                "n_initial_blocks": args.n_initial_blocks,
+                "n_encoder_blocks": args.n_encoder_blocks,
                 "label_encoder": label_encoder,
             }, "best_model.pt")
             print(f"  -> Saved best model (val RMSE: {val_rmse:.4f})")

@@ -1,27 +1,26 @@
 """
-Comprehensive test suite for transformer.py (Updated for flexible property configuration)
+Comprehensive test suite for transformer.py (Flexible Attachment Architecture)
 
 Tests all components individually and integration:
 - Tokenizers (SMILES/SELFIES)
 - LabelEncoder
 - Dataset loading
-- Model components (positional encoding, cross-attention, property blocks)
-- Full hierarchical transformer with flexible configurations
+- Model components (positional encoding, cross-attention, PropertyHead)
+- Full HierarchicalTransformer with flexible attachment points
 - Training/evaluation functions
-- New features: optional cross-attention, variable property selection
+- New features: per-property attachment blocks, optional cross-attention
 
 Usage:
-    python tests_updated.py
+    python tests.py
 
 Or run specific test:
-    python tests_updated.py TestHierarchicalTransformer.test_flexible_property_selection
+    python tests.py TestHierarchicalTransformer.test_parallel_attachment
 """
 
 import unittest
 import tempfile
 import json
 import os
-from pathlib import Path
 
 import h5py
 import numpy as np
@@ -38,7 +37,7 @@ from transformer import (
     collate_fn,
     LearnedPositionalEncoding,
     CrossAttention,
-    PropertyBlock,
+    PropertyHead,
     HierarchicalTransformer,
     train_one_epoch,
     evaluate,
@@ -129,102 +128,110 @@ class TestLabelEncoder(unittest.TestCase):
         self.assertEqual(self.encoder.get_num_classes("prop2"), 2)
 
 
-class TestPropertyBlock(unittest.TestCase):
-    """Test PropertyBlock with new flexible configuration options."""
+class TestPropertyHead(unittest.TestCase):
+    """Test PropertyHead with flexible configuration options."""
 
-    def test_property_block_with_cross_attention(self):
-        """Test PropertyBlock with cross-attention enabled."""
-        block = PropertyBlock(
+    def test_classification_head_without_cross_attention(self):
+        """Test classification head without cross-attention."""
+        head = PropertyHead(
             d_model=128,
-            nhead=4,
-            num_layers=2,
             task="classification",
             num_classes=5,
-            use_cross_attention=True,
-            provide_embeddings=True
+            use_cross_attention=False
         )
 
-        self.assertTrue(hasattr(block, 'cross_attn'))
-        self.assertTrue(hasattr(block, 'pred_embedding'))
+        self.assertFalse(hasattr(head, 'pred_embedding'))
 
-    def test_property_block_without_cross_attention(self):
-        """Test PropertyBlock with cross-attention disabled."""
-        block = PropertyBlock(
+    def test_classification_head_with_cross_attention(self):
+        """Test classification head with cross-attention enabled."""
+        head = PropertyHead(
             d_model=128,
-            nhead=4,
-            num_layers=2,
             task="classification",
             num_classes=5,
-            use_cross_attention=False,
-            provide_embeddings=True
+            use_cross_attention=True
         )
 
-        self.assertFalse(hasattr(block, 'cross_attn'))
-        self.assertTrue(hasattr(block, 'pred_embedding'))
+        self.assertTrue(hasattr(head, 'pred_embedding'))
+        self.assertIsInstance(head.pred_embedding, nn.Embedding)
 
-    def test_property_block_without_embeddings(self):
-        """Test PropertyBlock that doesn't provide embeddings."""
-        block = PropertyBlock(
+    def test_regression_head_without_cross_attention(self):
+        """Test regression head without cross-attention."""
+        head = PropertyHead(
             d_model=128,
-            nhead=4,
-            num_layers=2,
-            task="classification",
-            num_classes=5,
-            use_cross_attention=True,
-            provide_embeddings=False
+            task="regression",
+            use_cross_attention=False
         )
 
-        self.assertTrue(hasattr(block, 'cross_attn'))
-        self.assertFalse(hasattr(block, 'pred_embedding'))
+        self.assertFalse(hasattr(head, 'pred_embedding'))
 
-    def test_property_block_forward_no_cross_attention(self):
-        """Test forward pass without cross-attention."""
-        block = PropertyBlock(
+    def test_regression_head_with_cross_attention(self):
+        """Test regression head with cross-attention enabled."""
+        head = PropertyHead(
             d_model=128,
-            nhead=4,
-            num_layers=2,
+            task="regression",
+            use_cross_attention=True
+        )
+
+        self.assertTrue(hasattr(head, 'pred_embedding'))
+        self.assertIsInstance(head.pred_embedding, nn.Linear)
+
+    def test_forward_classification_without_cross_attention(self):
+        """Test forward pass for classification without cross-attention."""
+        head = PropertyHead(
+            d_model=128,
             task="classification",
             num_classes=5,
-            use_cross_attention=False,
-            provide_embeddings=False
+            use_cross_attention=False
         )
 
         batch_size = 4
         seq_len = 32
         x = torch.randn(batch_size, seq_len, 128)
-        attn_mask = torch.ones(batch_size, seq_len)
 
-        logits, pred_emb = block(x, attn_mask, prev_memory=None)
+        logits, pred_emb = head(x)
 
         self.assertEqual(logits.shape, (batch_size, 5))
         self.assertIsNone(pred_emb)
 
-    def test_property_block_forward_with_cross_attention(self):
-        """Test forward pass with cross-attention."""
-        block = PropertyBlock(
+    def test_forward_classification_with_cross_attention(self):
+        """Test forward pass for classification with cross-attention."""
+        head = PropertyHead(
             d_model=128,
-            nhead=4,
-            num_layers=2,
             task="classification",
             num_classes=5,
-            use_cross_attention=True,
-            provide_embeddings=True
+            use_cross_attention=True
         )
 
         batch_size = 4
         seq_len = 32
         x = torch.randn(batch_size, seq_len, 128)
-        attn_mask = torch.ones(batch_size, seq_len)
-        prev_memory = torch.randn(batch_size, seq_len, 128)
 
-        logits, pred_emb = block(x, attn_mask, prev_memory=prev_memory, prev_memory_mask=attn_mask)
+        logits, pred_emb = head(x)
 
         self.assertEqual(logits.shape, (batch_size, 5))
+        self.assertIsNotNone(pred_emb)
         self.assertEqual(pred_emb.shape, (batch_size, seq_len, 128))
+
+    def test_forward_regression(self):
+        """Test forward pass for regression."""
+        head = PropertyHead(
+            d_model=128,
+            task="regression",
+            use_cross_attention=False
+        )
+
+        batch_size = 4
+        seq_len = 32
+        x = torch.randn(batch_size, seq_len, 128)
+
+        logits, pred_emb = head(x)
+
+        self.assertEqual(logits.shape, (batch_size, 1))
+        self.assertIsNone(pred_emb)
 
 
 class TestHierarchicalTransformer(unittest.TestCase):
-    """Test full hierarchical transformer model with flexible configurations."""
+    """Test full hierarchical transformer with flexible attachment architecture."""
 
     def setUp(self):
         """Set up model configuration."""
@@ -233,79 +240,24 @@ class TestHierarchicalTransformer(unittest.TestCase):
         self.d_model = 128
         self.batch_size = 4
 
-    def test_model_initialization_with_names(self):
-        """Test model initializes with property names."""
-        property_configs = [
-            {"name": "dimension", "task": "classification", "num_classes": 5, "n_blocks": 2},
-            {"name": "ring_count", "task": "classification", "num_classes": 3, "n_blocks": 2},
-            {"name": "chirality", "task": "regression", "n_blocks": 1},
-        ]
-
-        model = HierarchicalTransformer(
-            vocab_size=self.vocab_size,
-            property_configs=property_configs,
-            max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=4
-        )
-
-        # Check model has correct number of property blocks
-        self.assertEqual(len(model.properties), 3)
-        self.assertEqual(model.property_names, ["dimension", "ring_count", "chirality"])
-
-    def test_model_forward_with_property_names(self):
-        """Test forward pass produces outputs keyed by property names."""
-        property_configs = [
-            {"name": "dimension", "task": "classification", "num_classes": 5, "n_blocks": 2},
-            {"name": "ring_count", "task": "classification", "num_classes": 3, "n_blocks": 2},
-            {"name": "planarity", "task": "regression", "n_blocks": 1},
-        ]
-
-        model = HierarchicalTransformer(
-            vocab_size=self.vocab_size,
-            property_configs=property_configs,
-            max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=4
-        )
-
-        # Create dummy input
-        input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.max_len))
-        attention_mask = torch.ones(self.batch_size, self.max_len)
-
-        # Forward pass
-        outputs = model(input_ids, attention_mask)
-
-        # Check outputs are keyed by property names
-        self.assertIsInstance(outputs, dict)
-        self.assertIn("dimension", outputs)
-        self.assertIn("ring_count", outputs)
-        self.assertIn("planarity", outputs)
-
-        # Check shapes
-        self.assertEqual(outputs["dimension"].shape, (self.batch_size, 5))
-        self.assertEqual(outputs["ring_count"].shape, (self.batch_size, 3))
-        self.assertEqual(outputs["planarity"].shape, (self.batch_size, 1))
-
-    def test_single_property_model(self):
-        """Test model with only one property."""
+    def test_default_mode_single_head_at_end(self):
+        """Test default mode: single head attached to last block."""
         property_configs = [
             {
                 "name": "dimension",
                 "task": "classification",
                 "num_classes": 5,
-                "n_blocks": 2,
-                "use_cross_attention": False,  # First property, no cross-attention
-                "provide_embeddings": False  # Last property, no need for embeddings
+                "attach_at_block": 3,  # Last block (n_encoder_blocks=4)
+                "use_cross_attention": False
             }
         ]
 
         model = HierarchicalTransformer(
             vocab_size=self.vocab_size,
             property_configs=property_configs,
+            n_encoder_blocks=4,
             max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=4
+            d_model=self.d_model
         )
 
         input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.max_len))
@@ -317,40 +269,38 @@ class TestHierarchicalTransformer(unittest.TestCase):
         self.assertIn("dimension", outputs)
         self.assertEqual(outputs["dimension"].shape, (self.batch_size, 5))
 
-    def test_model_with_selective_cross_attention(self):
-        """Test model where only some properties use cross-attention."""
+    def test_parallel_mode_all_heads_same_block(self):
+        """Test parallel mode: all heads attached to same block."""
         property_configs = [
             {
-                "name": "prop1",
+                "name": "dimension",
                 "task": "classification",
-                "num_classes": 3,
-                "n_blocks": 1,
-                "use_cross_attention": False,
-                "provide_embeddings": True
+                "num_classes": 5,
+                "attach_at_block": 1,
+                "use_cross_attention": False
             },
             {
-                "name": "prop2",
+                "name": "ring_count",
                 "task": "classification",
-                "num_classes": 4,
-                "n_blocks": 1,
-                "use_cross_attention": True,  # Uses cross-attention from prop1
-                "provide_embeddings": True
+                "num_classes": 7,
+                "attach_at_block": 1,  # Same block as dimension
+                "use_cross_attention": False
             },
             {
-                "name": "prop3",
-                "task": "regression",
-                "n_blocks": 1,
-                "use_cross_attention": False,  # Independent of prop2
-                "provide_embeddings": False
+                "name": "chirality",
+                "task": "classification",
+                "num_classes": 2,
+                "attach_at_block": 1,  # Same block as others
+                "use_cross_attention": False
             }
         ]
 
         model = HierarchicalTransformer(
             vocab_size=self.vocab_size,
             property_configs=property_configs,
+            n_encoder_blocks=2,
             max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=2
+            d_model=self.d_model
         )
 
         input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.max_len))
@@ -359,20 +309,105 @@ class TestHierarchicalTransformer(unittest.TestCase):
         outputs = model(input_ids, attention_mask)
 
         self.assertEqual(len(outputs), 3)
-        self.assertIn("prop1", outputs)
-        self.assertIn("prop2", outputs)
-        self.assertIn("prop3", outputs)
+        self.assertEqual(outputs["dimension"].shape, (self.batch_size, 5))
+        self.assertEqual(outputs["ring_count"].shape, (self.batch_size, 7))
+        self.assertEqual(outputs["chirality"].shape, (self.batch_size, 2))
 
-    def test_model_gradient_flow(self):
-        """Test gradients flow through entire model."""
+    def test_hierarchical_mode_different_blocks_with_cross_attention(self):
+        """Test hierarchical mode: heads at different blocks with cross-attention."""
         property_configs = [
-            {"name": "prop1", "task": "classification", "num_classes": 3, "n_blocks": 1},
-            {"name": "prop2", "task": "regression", "n_blocks": 1},
+            {
+                "name": "dimension",
+                "task": "classification",
+                "num_classes": 5,
+                "attach_at_block": 0,  # First block
+                "use_cross_attention": True  # Enable for feedback to block 1
+            },
+            {
+                "name": "ring_count",
+                "task": "classification",
+                "num_classes": 7,
+                "attach_at_block": 1,  # Second block
+                "use_cross_attention": True  # Enable for feedback to block 2
+            },
+            {
+                "name": "chirality",
+                "task": "classification",
+                "num_classes": 2,
+                "attach_at_block": 2,  # Third block
+                "use_cross_attention": False  # Last property, no feedback needed
+            }
         ]
 
         model = HierarchicalTransformer(
             vocab_size=self.vocab_size,
             property_configs=property_configs,
+            n_encoder_blocks=3,
+            max_len=self.max_len,
+            d_model=self.d_model
+        )
+
+        input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.max_len))
+        attention_mask = torch.ones(self.batch_size, self.max_len)
+
+        outputs = model(input_ids, attention_mask)
+
+        self.assertEqual(len(outputs), 3)
+        self.assertIn("dimension", outputs)
+        self.assertIn("ring_count", outputs)
+        self.assertIn("chirality", outputs)
+
+    def test_mixed_mode_some_parallel_some_hierarchical(self):
+        """Test mixed mode: some properties parallel, some hierarchical."""
+        property_configs = [
+            {
+                "name": "prop1",
+                "task": "classification",
+                "num_classes": 3,
+                "attach_at_block": 0,
+                "use_cross_attention": True
+            },
+            {
+                "name": "prop2",
+                "task": "classification",
+                "num_classes": 4,
+                "attach_at_block": 2,  # Skip block 1
+                "use_cross_attention": False
+            },
+            {
+                "name": "prop3",
+                "task": "regression",
+                "attach_at_block": 2,  # Same as prop2 (parallel)
+                "use_cross_attention": False
+            }
+        ]
+
+        model = HierarchicalTransformer(
+            vocab_size=self.vocab_size,
+            property_configs=property_configs,
+            n_encoder_blocks=3,
+            max_len=self.max_len,
+            d_model=self.d_model
+        )
+
+        input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.max_len))
+        attention_mask = torch.ones(self.batch_size, self.max_len)
+
+        outputs = model(input_ids, attention_mask)
+
+        self.assertEqual(len(outputs), 3)
+
+    def test_model_gradient_flow(self):
+        """Test gradients flow through entire model."""
+        property_configs = [
+            {"name": "prop1", "task": "classification", "num_classes": 3, "attach_at_block": 0},
+            {"name": "prop2", "task": "regression", "attach_at_block": 1},
+        ]
+
+        model = HierarchicalTransformer(
+            vocab_size=self.vocab_size,
+            property_configs=property_configs,
+            n_encoder_blocks=2,
             max_len=self.max_len,
             d_model=self.d_model
         )
@@ -386,7 +421,7 @@ class TestHierarchicalTransformer(unittest.TestCase):
         loss = outputs["prop1"].sum() + outputs["prop2"].sum()
         loss.backward()
 
-        # Check gradients exist
+        # Check at least some gradients exist
         has_gradients = False
         for name, param in model.named_parameters():
             if param.requires_grad and param.grad is not None:
@@ -395,9 +430,45 @@ class TestHierarchicalTransformer(unittest.TestCase):
 
         self.assertTrue(has_gradients, "No gradients found in model parameters")
 
+    def test_invalid_attachment_block(self):
+        """Test that invalid attachment block raises error."""
+        property_configs = [
+            {
+                "name": "dimension",
+                "task": "classification",
+                "num_classes": 5,
+                "attach_at_block": 5,  # Invalid: n_encoder_blocks=4
+                "use_cross_attention": False
+            }
+        ]
+
+        with self.assertRaises(ValueError):
+            model = HierarchicalTransformer(
+                vocab_size=self.vocab_size,
+                property_configs=property_configs,
+                n_encoder_blocks=4,
+                max_len=self.max_len,
+                d_model=self.d_model
+            )
+
+    def test_invalid_n_encoder_blocks(self):
+        """Test that n_encoder_blocks < 1 raises error."""
+        property_configs = [
+            {"name": "dimension", "task": "classification", "num_classes": 5, "attach_at_block": 0}
+        ]
+
+        with self.assertRaises(ValueError):
+            model = HierarchicalTransformer(
+                vocab_size=self.vocab_size,
+                property_configs=property_configs,
+                n_encoder_blocks=0,  # Invalid
+                max_len=self.max_len,
+                d_model=self.d_model
+            )
+
 
 class TestTrainingFunctions(unittest.TestCase):
-    """Test training and evaluation functions with updated property configs."""
+    """Test training and evaluation functions."""
 
     def setUp(self):
         """Set up dummy model and data."""
@@ -408,21 +479,21 @@ class TestTrainingFunctions(unittest.TestCase):
         self.batch_size = 4
 
         self.property_configs = [
-            {"name": "dimension", "task": "classification", "num_classes": 3, "n_blocks": 1},
-            {"name": "ring_count", "task": "classification", "num_classes": 4, "n_blocks": 1},
-            {"name": "chirality", "task": "classification", "num_classes": 2, "n_blocks": 1},
-            {"name": "n_symmetry_planes", "task": "classification", "num_classes": 5, "n_blocks": 1},
-            {"name": "point_group", "task": "classification", "num_classes": 5, "n_blocks": 1},
-            {"name": "planar_fit_error", "task": "regression", "n_blocks": 1},
-            {"name": "ring_plane_angles", "task": "regression", "n_blocks": 1},
+            {"name": "dimension", "task": "classification", "num_classes": 3, "attach_at_block": 1},
+            {"name": "ring_count", "task": "classification", "num_classes": 4, "attach_at_block": 1},
+            {"name": "chirality", "task": "classification", "num_classes": 2, "attach_at_block": 1},
+            {"name": "n_symmetry_planes", "task": "classification", "num_classes": 5, "attach_at_block": 1},
+            {"name": "point_group", "task": "classification", "num_classes": 5, "attach_at_block": 1},
+            {"name": "planar_fit_error", "task": "regression", "attach_at_block": 1},
+            {"name": "ring_plane_angles", "task": "regression", "attach_at_block": 1},
         ]
 
         self.model = HierarchicalTransformer(
             vocab_size=self.vocab_size,
             property_configs=self.property_configs,
+            n_encoder_blocks=2,
             max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=2
+            d_model=self.d_model
         )
 
     def create_dummy_dataloader(self, n_batches=5):
@@ -476,7 +547,7 @@ class TestTrainingFunctions(unittest.TestCase):
             dataloader,
             optimizer,
             self.device,
-            self.property_configs,  # Updated: now accepts property_configs
+            self.property_configs,
             bf16=False
         )
 
@@ -492,7 +563,7 @@ class TestTrainingFunctions(unittest.TestCase):
             self.model,
             dataloader,
             self.device,
-            self.property_configs,  # Updated: now accepts property_configs
+            self.property_configs,
             bf16=False
         )
 
@@ -554,136 +625,6 @@ class TestTrainingFunctions(unittest.TestCase):
             if param.grad is not None:
                 self.assertTrue(torch.all(param.grad == 0))
 
-    def test_training_with_subset_of_properties(self):
-        """Test training with only a subset of properties."""
-        # Create model with only 2 properties
-        subset_configs = [
-            {"name": "dimension", "task": "classification", "num_classes": 3, "n_blocks": 1},
-            {"name": "chirality", "task": "classification", "num_classes": 2, "n_blocks": 1},
-        ]
-
-        model = HierarchicalTransformer(
-            vocab_size=self.vocab_size,
-            property_configs=subset_configs,
-            max_len=self.max_len,
-            d_model=self.d_model,
-            n_initial_blocks=2
-        )
-
-        dataloader = self.create_dummy_dataloader(n_batches=2)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-        # Should run without errors even though dataloader has more properties
-        loss = train_one_epoch(
-            model,
-            dataloader,
-            optimizer,
-            self.device,
-            subset_configs,
-            bf16=False
-        )
-
-        self.assertIsInstance(loss, float)
-        self.assertGreater(loss, 0)
-
-
-class TestFlexibleConfiguration(unittest.TestCase):
-    """Test new flexible configuration features."""
-
-    def test_all_properties_independent(self):
-        """Test configuration where all properties are independent (no cross-attention)."""
-        property_configs = [
-            {
-                "name": "prop1",
-                "task": "classification",
-                "num_classes": 3,
-                "n_blocks": 1,
-                "use_cross_attention": False,
-                "provide_embeddings": False
-            },
-            {
-                "name": "prop2",
-                "task": "classification",
-                "num_classes": 4,
-                "n_blocks": 1,
-                "use_cross_attention": False,
-                "provide_embeddings": False
-            },
-            {
-                "name": "prop3",
-                "task": "regression",
-                "n_blocks": 1,
-                "use_cross_attention": False,
-                "provide_embeddings": False
-            }
-        ]
-
-        model = HierarchicalTransformer(
-            vocab_size=100,
-            property_configs=property_configs,
-            max_len=64,
-            d_model=128,
-            n_initial_blocks=4
-        )
-
-        batch_size = 4
-        input_ids = torch.randint(0, 100, (batch_size, 64))
-        attention_mask = torch.ones(batch_size, 64)
-
-        outputs = model(input_ids, attention_mask)
-
-        # All outputs should be present
-        self.assertEqual(len(outputs), 3)
-        self.assertIn("prop1", outputs)
-        self.assertIn("prop2", outputs)
-        self.assertIn("prop3", outputs)
-
-    def test_sequential_dependencies(self):
-        """Test configuration where properties have sequential dependencies."""
-        property_configs = [
-            {
-                "name": "prop1",
-                "task": "classification",
-                "num_classes": 3,
-                "n_blocks": 1,
-                "use_cross_attention": False,
-                "provide_embeddings": True
-            },
-            {
-                "name": "prop2",
-                "task": "classification",
-                "num_classes": 4,
-                "n_blocks": 1,
-                "use_cross_attention": True,
-                "provide_embeddings": True
-            },
-            {
-                "name": "prop3",
-                "task": "regression",
-                "n_blocks": 1,
-                "use_cross_attention": True,
-                "provide_embeddings": False
-            }
-        ]
-
-        model = HierarchicalTransformer(
-            vocab_size=100,
-            property_configs=property_configs,
-            max_len=64,
-            d_model=128,
-            n_initial_blocks=4
-        )
-
-        batch_size = 4
-        input_ids = torch.randint(0, 100, (batch_size, 64))
-        attention_mask = torch.ones(batch_size, 64)
-
-        outputs = model(input_ids, attention_mask)
-
-        self.assertEqual(len(outputs), 3)
-        # prop2 should use cross-attention from prop1
-        # prop3 should use cross-attention from prop2
-
 
 class TestDeterminism(unittest.TestCase):
     """Test model determinism with fixed random seed."""
@@ -693,16 +634,16 @@ class TestDeterminism(unittest.TestCase):
         torch.manual_seed(42)
 
         property_configs = [
-            {"name": "prop1", "task": "classification", "num_classes": 3, "n_blocks": 1},
-            {"name": "prop2", "task": "regression", "n_blocks": 1},
+            {"name": "prop1", "task": "classification", "num_classes": 3, "attach_at_block": 0},
+            {"name": "prop2", "task": "regression", "attach_at_block": 1},
         ]
 
         model = HierarchicalTransformer(
             vocab_size=100,
             property_configs=property_configs,
+            n_encoder_blocks=2,
             max_len=64,
-            d_model=128,
-            n_initial_blocks=2
+            d_model=128
         )
         model.eval()  # Set to eval mode for deterministic behavior
 
