@@ -5,9 +5,11 @@ mol3d_data/*.h5
 *.log
 *.tmp
 *.pyc
+*.txt
 __pycache__/
 .ipynb_checkpoints/
 
 # Ignore Claude files
 CLAUDE.md
+changes_log.md
 .claude/
