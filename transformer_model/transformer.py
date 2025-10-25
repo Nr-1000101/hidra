@@ -2,7 +2,9 @@
 # coding: utf-8
 
 """
-HIDRA: Flexible Transformer for predicting molecular properties from SMILES/SELFIES.
+HIDRA: HIerarchical DFT accuracy transformer model to Reconstruct Atomic geometry
+
+Main training script for molecular property prediction from SMILES/SELFIES sequences.
 
 Architecture:
     1. Token + positional embeddings
@@ -21,892 +23,31 @@ Configuration modes:
     - Parallel: N blocks → all heads at same block (shared representation)
     - Hierarchical: Heads at different blocks with cross-attention feedback
 """
+
 import argparse
+import json
+import os
+import pickle
 import random
-import re
-from typing import List, Dict, Tuple, Optional
+from pathlib import Path
 
 import h5py
-import json
-import numpy as np
-import selfies as sf
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import DataLoader, random_split
+
+# Import all components from the package
+from tokenizers import LabelEncoder, SelfiesTokenizer, SmilesTokenizer
+from dataset import H5SequenceDataset, collate_fn
+from model import HierarchicalTransformer
+from metrics import FocalLoss, compute_class_weights
+from early_stopping import EarlyStoppingMonitor
+from training import train_one_epoch, evaluate
 
 # Reproducibility
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
-
-# --- Vocab Loader ---
-def load_vocab(vocab_file: str) -> Tuple[List[str], Dict[str, int], Dict[int, str]]:
-    """Load vocabulary from JSON file.
-
-    Args:
-        vocab_file: Path to vocab JSON file
-
-    Returns:
-        tokens: List of all tokens
-        token_to_id: Token string to ID mapping
-        id_to_token: ID to token string mapping
-    """
-    with open(vocab_file, "r") as f:
-        vocab = json.load(f)
-    return vocab["tokens"], vocab["token_to_id"], {int(k): v for k, v in vocab["id_to_token"].items()}
-
-
-# --- Label Encoder ---
-class LabelEncoder:
-    """Encodes string labels to integer indices for classification tasks."""
-    
-    def __init__(self):
-        self.label_to_idx: Dict[str, Dict[str, int]] = {}
-        self.idx_to_label: Dict[str, Dict[int, str]] = {}
-    
-    def fit(self, property_name: str, labels: List[str]):
-        """Create encoding for a property's labels.
-        
-        Args:
-            property_name: Name of the property (e.g., 'dimension')
-            labels: List of unique string labels
-        """
-        unique_labels = sorted(set(labels))
-        self.label_to_idx[property_name] = {label: idx for idx, label in enumerate(unique_labels)}
-        self.idx_to_label[property_name] = {idx: label for idx, label in enumerate(unique_labels)}
-    
-    def transform(self, property_name: str, label: str) -> int:
-        """Convert label to index."""
-        return self.label_to_idx[property_name].get(label, 0)  # Default to 0 if unknown
-    
-    def inverse_transform(self, property_name: str, idx: int) -> str:
-        """Convert index back to label."""
-        if property_name not in self.idx_to_label:
-            return "unknown"
-        return self.idx_to_label[property_name].get(idx, "unknown")
-    
-    def get_num_classes(self, property_name: str) -> int:
-        """Get number of classes for a property."""
-        return len(self.label_to_idx.get(property_name, {}))
-
-
-# --- SELFIES Tokenizer ---
-class SelfiesTokenizer:
-    """Tokenizer for SELFIES molecular representations."""
-    
-    def __init__(self, vocab_file: str):
-        """Initialize tokenizer from vocabulary file.
-        
-        Args:
-            vocab_file: Path to SELFIES vocabulary JSON
-        """
-        self.tokens, self.token_to_id, self.id_to_token = load_vocab(vocab_file)
-        self.reserved_tokens = ["<pad>", "<unk>", "<bos>", "<eos>"]
-
-    def encode(self, s: str, add_special: bool = True) -> List[int]:
-        """Encode SELFIES string to token IDs.
-        
-        Args:
-            s: SELFIES string
-            add_special: Whether to add BOS/EOS tokens
-            
-        Returns:
-            List of token IDs
-        """
-        toks = list(sf.split_selfies(s))
-        ids = [self.token_to_id.get(t, self.token_to_id["<unk>"]) for t in toks]
-        if add_special:
-            return [self.token_to_id["<bos>"]] + ids + [self.token_to_id["<eos>"]]
-        return ids
-
-    def decode(self, ids: List[int]) -> str:
-        """Decode token IDs back to SELFIES string.
-        
-        Args:
-            ids: List of token IDs
-            
-        Returns:
-            SELFIES string
-        """
-        toks = [self.id_to_token.get(i, "?") for i in ids]
-        toks = [t for t in toks if t not in self.reserved_tokens]
-        return sf.decoder("".join(toks))
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.tokens)
-
-
-# --- SMILES Tokenizer ---
-SMILES_REGEX = re.compile(
-    r"""([A-Z][a-z]?               # single and multi-letter atoms
-        | \[ [^\]]+ \]             # bracketed expressions
-        | @@?                      # stereochemistry @ / @@
-        | [=#\+/\\-]               # bonds (hyphen at end to avoid range)
-        | \(|\)|\.|\*              # parentheses, dot, wildcard
-        | \d                       # single-digit ring closures
-        | %\d{2}                   # two-digit ring closures
-    )""",
-    re.X
-)
-
-class SmilesTokenizer:
-    """Tokenizer for SMILES molecular representations."""
-    
-    def __init__(self, vocab_file: str):
-        """Initialize tokenizer from vocabulary file.
-        
-        Args:
-            vocab_file: Path to SMILES vocabulary JSON
-        """
-        self.tokens, self.token_to_id, self.id_to_token = load_vocab(vocab_file)
-        self.reserved_tokens = ["<pad>", "<unk>", "<bos>", "<eos>"]
-
-    def _tokenize_smiles(self, smiles: str) -> List[str]:
-        """Tokenize SMILES string into tokens using regex pattern."""
-        return [t for t in SMILES_REGEX.findall(smiles) if t]
-
-    def encode(self, s: str, add_special: bool = True) -> List[int]:
-        """Encode SMILES string to token IDs.
-
-        Args:
-            s: SMILES string
-            add_special: Whether to add BOS/EOS tokens
-
-        Returns:
-            List of token IDs
-        """
-        toks = self._tokenize_smiles(s)
-        ids = [self.token_to_id.get(t, self.token_to_id["<unk>"]) for t in toks]
-        if add_special:
-            return [self.token_to_id["<bos>"]] + ids + [self.token_to_id["<eos>"]]
-        return ids
-
-    def decode(self, ids: List[int]) -> str:
-        """Decode token IDs back to SMILES string.
-        
-        Args:
-            ids: List of token IDs
-            
-        Returns:
-            SMILES string
-        """
-        toks = [self.id_to_token.get(i, "?") for i in ids]
-        toks = [t for t in toks if t not in self.reserved_tokens]
-        return "".join(toks)
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.tokens)
-
-
-# --- Dataset from HDF5 ---
-class H5SequenceDataset(Dataset):
-    """Dataset for loading molecular sequences and features from HDF5 files.
-    
-    Supports multiple HDF5 files and handles:
-    - SMILES/SELFIES tokenization
-    - Feature extraction (dimensions, symmetry, rings, etc.)
-    - Label binning for underrepresented classes
-    """
-    
-    def __init__(
-        self,
-        mol_files: List[str],
-        feat_files: List[str],
-        tokenizer,
-        label_encoder: LabelEncoder,
-        underrepresented_data_file: str = "mol3d_data/underrepresented_data.json",
-        mode: str = "smiles",
-        max_len: int = 512,
-        max_molecules: Optional[int] = None
-    ):
-        """Initialize dataset.
-        
-        Args:
-            mol_files: List of HDF5 files with molecule sequences
-            feat_files: List of HDF5 files with molecular features
-            tokenizer: Tokenizer instance (SMILES or SELFIES)
-            label_encoder: LabelEncoder for string→int conversion
-            underrepresented_data_file: JSON with binning thresholds
-            mode: "smiles" or "selfies"
-            max_len: Maximum sequence length
-            max_molecules: Maximum number of molecules to load (None = all)
-        """
-        self.mol_files = mol_files
-        self.feat_files = feat_files
-        self.tokenizer = tokenizer
-        self.label_encoder = label_encoder
-        self.max_len = max_len
-        self.mode = mode
-        self.max_molecules = max_molecules
-
-        # Precompute file offsets for efficient indexing across multiple files
-        self.mol_file_offsets = [0]
-        for mf in mol_files:
-            with h5py.File(mf, "r") as f:
-                n_mols = len(f[mode])
-                self.mol_file_offsets.append(self.mol_file_offsets[-1] + n_mols)
-
-        # Precompute index map: (file_id, index_in_file)
-        self.entries = []
-        total_added = 0
-        for fid, mf in enumerate(mol_files):
-            with h5py.File(mf, "r") as f:
-                n_mols = len(f[mode])
-                for idx in range(n_mols):
-                    if self.max_molecules is not None and total_added >= self.max_molecules:
-                        break
-                    self.entries.append((fid, idx))
-                    total_added += 1
-            if self.max_molecules is not None and total_added >= self.max_molecules:
-                break
-
-        # Load ring info into memory for fast access
-        self.load_ring_info()
-        
-        # Load binning thresholds
-        with open(underrepresented_data_file, "r") as f:
-            self.underrepresented_groups = json.load(f)
-
-    def load_ring_info(self):
-        """Load ring-related datasets into memory for fast access.
-
-        Memory-efficient: stores data as numpy arrays with offset-based indexing
-        instead of creating nested Python lists. Only loads molecules in self.entries.
-        """
-        # Find max molecule index per file to minimize data loading
-        max_mol_idx_per_file = {}
-        for file_id, mol_idx in self.entries:
-            if file_id not in max_mol_idx_per_file:
-                max_mol_idx_per_file[file_id] = mol_idx
-            else:
-                max_mol_idx_per_file[file_id] = max(max_mol_idx_per_file[file_id], mol_idx)
-
-        all_ring_counts = []
-        all_planar_errors = []
-        all_plane_angles = []
-        plane_angle_offsets = [0]
-
-        for file_id, feat_file in enumerate(self.feat_files):
-            if file_id not in max_mol_idx_per_file:
-                continue
-
-            with h5py.File(feat_file, "r") as f:
-                # Load only needed molecules from this file
-                max_mol_idx = max_mol_idx_per_file[file_id] + 1
-                file_ring_counts = f["nrings"][:max_mol_idx]
-                all_ring_counts.extend(file_ring_counts)
-                all_planar_errors.extend(f["errors"][:max_mol_idx])
-
-                # Calculate number of ring pair angles needed
-                n_angles_needed = sum(n_rings * (n_rings - 1) // 2 for n_rings in file_ring_counts)
-
-                # Load plane angles as numpy array
-                plane_angles_arr = f["plane_angles"][:n_angles_needed]
-                all_plane_angles.append(plane_angles_arr)
-
-                # Build offset map for fast molecule→angles lookup
-                offset = plane_angle_offsets[-1]
-                for n_rings in file_ring_counts:
-                    n_pairs = n_rings * (n_rings - 1) // 2
-                    offset += n_pairs
-                    plane_angle_offsets.append(offset)
-
-        # Concatenate all arrays
-        if all_plane_angles:
-            self.ring_plane_angles_data = np.concatenate(all_plane_angles)
-        else:
-            self.ring_plane_angles_data = np.array([], dtype=[("i", "i4"), ("j", "i4"), ("val", "f4")])
-
-        self.ring_counts = np.array(all_ring_counts)
-        self.planar_fit_errors = np.array(all_planar_errors)
-        self.ring_angle_offsets = plane_angle_offsets
-
-    def __len__(self):
-        return len(self.entries)
-
-    def bin_label(self, label: int, threshold: int) -> str:
-        """Bin integer labels with catch-all for values >= threshold.
-
-        Args:
-            label: Integer label value
-            threshold: Threshold for catch-all bin
-
-        Returns:
-            String label (e.g., "0", "1", "5+")
-        """
-        return str(label) if label < threshold else f"{threshold}+"
-
-    def map_underrepresented_label(self, label: str, underrep_labels: List[str], catch_all: str = "Other") -> str:
-        """Map underrepresented labels to a catch-all category.
-
-        Args:
-            label: Original label
-            underrep_labels: List of labels to map to catch-all
-            catch_all: Catch-all category name
-
-        Returns:
-            Mapped label
-        """
-        return catch_all if label in underrep_labels else label
-
-    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """Get a single data sample.
-
-        Args:
-            i: Sample index
-
-        Returns:
-            input_ids: Tokenized sequence (padded)
-            attention_mask: Mask for valid tokens
-            targets: Dictionary of target values for each property
-        """
-        file_id, mol_idx = self.entries[i]
-
-        # Load and tokenize sequence
-        with h5py.File(self.mol_files[file_id], "r") as f_mol:
-            seq = f_mol[self.mode][mol_idx].decode("utf-8")
-
-        # Tokenize with BOS/EOS and pad/truncate
-        pad_id = self.tokenizer.token_to_id["<pad>"]
-        bos_id = self.tokenizer.token_to_id["<bos>"]
-        eos_id = self.tokenizer.token_to_id["<eos>"]
-
-        tokens = [bos_id] + self.tokenizer.encode(seq, add_special=False)
-        if len(tokens) >= self.max_len:
-            tokens = tokens[:self.max_len - 1]
-        tokens = tokens + [eos_id]
-
-        if len(tokens) < self.max_len:
-            tokens = tokens + [pad_id] * (self.max_len - len(tokens))
-
-        input_ids = torch.tensor(tokens, dtype=torch.long)
-        attention_mask = (input_ids != pad_id).long()
-
-        # Load molecular features from HDF5
-        with h5py.File(self.feat_files[file_id], "r") as f_feat:
-            dimension = f_feat["dimensions"][mol_idx].decode("utf-8")
-            point_group = self.map_underrepresented_label(
-                f_feat["point_groups"][mol_idx].decode("utf-8"),
-                self.underrepresented_groups["point_groups"]
-            )
-            n_symmetry_planes = self.bin_label(
-                int(f_feat["symmetry_planes"][mol_idx]),
-                self.underrepresented_groups["symmetry_planes"]
-            )
-            chirality = bool(f_feat["chiralities"][mol_idx])
-
-        # Get preloaded ring info using dataset-wide index
-        dataset_idx = self.mol_file_offsets[file_id] + mol_idx
-        ring_count = self.bin_label(
-            int(self.ring_counts[dataset_idx]),
-            self.underrepresented_groups["nrings"]
-        )
-        planar_fit_error = float(self.planar_fit_errors[dataset_idx])
-
-        # Get ring plane angles using offset map
-        angle_start = self.ring_angle_offsets[dataset_idx]
-        angle_end = self.ring_angle_offsets[dataset_idx + 1]
-        ring_plane_angles = self.ring_plane_angles_data[angle_start:angle_end]
-
-        # Build target dictionary
-        targets = {
-            "dimension": self.label_encoder.transform("dimension", dimension),
-            "ring_count": self.label_encoder.transform("ring_count", ring_count),
-            "chirality": int(chirality),
-            "n_symmetry_planes": self.label_encoder.transform("n_symmetry_planes", n_symmetry_planes),
-            "point_group": self.label_encoder.transform("point_group", point_group),
-            "planar_fit_error": planar_fit_error,
-            "ring_plane_angles": len(ring_plane_angles),  # Simplified: just count for now
-        }
-
-        return input_ids, attention_mask, targets
-
-
-def collate_fn(batch):
-    """Collate function for DataLoader batching.
-
-    Args:
-        batch: List of (input_ids, attention_mask, targets) tuples
-
-    Returns:
-        Batched input_ids, attention_masks, and targets dict
-    """
-    batch_input_ids = torch.stack([sample[0] for sample in batch])
-    batch_attn_masks = torch.stack([sample[1] for sample in batch])
-
-    # Stack targets for each property
-    prop_names = batch[0][2].keys()
-    batch_targets = {
-        prop: torch.tensor([sample[2][prop] for sample in batch])
-        for prop in prop_names
-    }
-
-    return batch_input_ids, batch_attn_masks, batch_targets
-
-
-# --- Positional Encoding ---
-class LearnedPositionalEncoding(nn.Module):
-    """Learned positional embeddings for sequence modeling."""
-    
-    def __init__(self, d_model: int = 512, max_len: int = 512):
-        """Initialize positional encoding.
-        
-        Args:
-            d_model: Embedding dimension
-            max_len: Maximum sequence length
-        """
-        super().__init__()
-        self.pe = nn.Embedding(max_len, d_model)
-        self.max_len = max_len
-        self.d_model = d_model
-        nn.init.normal_(self.pe.weight, mean=0.0, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Add positional embeddings to input.
-        
-        Args:
-            x: Input tensor (batch_size, seq_len, d_model)
-            
-        Returns:
-            x + positional embeddings
-        """
-        seq_len = x.size(1)
-        if seq_len > self.max_len:
-            raise ValueError(f"Sequence length {seq_len} exceeds max_len {self.max_len}")
-
-        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
-        pos_emb = self.pe(positions)
-        return x + pos_emb
-
-
-# --- Cross-Attention Module ---
-class CrossAttention(nn.Module):
-    """Cross-attention layer for conditioning on previous property predictions."""
-    
-    def __init__(self, d_model: int = 512, nhead: int = 8, dropout: float = 0.1):
-        """Initialize cross-attention.
-        
-        Args:
-            d_model: Model dimension
-            nhead: Number of attention heads
-            dropout: Dropout probability
-        """
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        memory: torch.Tensor,
-        memory_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Apply cross-attention.
-        
-        Args:
-            x: Query tensor (current property)
-            memory: Key/Value tensor (previous property embeddings)
-            memory_mask: Padding mask for memory
-            
-        Returns:
-            Updated x with cross-attention applied
-        """
-        attn_out, _ = self.attn(x, memory, memory, key_padding_mask=memory_mask)
-        x = x + self.dropout(attn_out)
-        x = self.norm(x)
-        return x
-
-# --- Property Head ---
-class PropertyHead(nn.Module):
-    """Prediction head for a single property with optional embedding for cross-attention.
-
-    Architecture:
-        1. Prediction head (classification or regression)
-        2. Optional prediction embedding for cross-attention feedback
-    """
-
-    def __init__(
-        self,
-        d_model: int = 512,
-        task: str = "classification",
-        num_classes: Optional[int] = None,
-        use_cross_attention: bool = False
-    ):
-        """Initialize property head.
-
-        Args:
-            d_model: Model dimension
-            task: "classification" or "regression"
-            num_classes: Number of classes (for classification)
-            use_cross_attention: Whether to generate embeddings for cross-attention feedback
-        """
-        super().__init__()
-        self.task = task
-        self.d_model = d_model
-        self.use_cross_attention = use_cross_attention
-
-        # Prediction head
-        if task == "classification":
-            assert num_classes is not None, "num_classes required for classification"
-            self.head = nn.Linear(d_model, num_classes)
-        elif task == "regression":
-            self.head = nn.Linear(d_model, 1)
-        else:
-            raise ValueError("task must be 'classification' or 'regression'")
-
-        # Embed prediction for cross-attention (optional)
-        if use_cross_attention:
-            if task == "classification":
-                self.pred_embedding = nn.Embedding(num_classes, d_model)
-            else:
-                self.pred_embedding = nn.Linear(1, d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass.
-
-        Args:
-            x: Input tensor (batch_size, seq_len, d_model)
-
-        Returns:
-            logits: Prediction logits
-            pred_embedding: Embedded prediction for cross-attention (None if use_cross_attention=False)
-        """
-        # Pool for prediction (use CLS token = first token)
-        pooled = x[:, 0]  # (batch_size, d_model)
-        logits = self.head(pooled)
-
-        # Embed prediction for cross-attention (if enabled)
-        pred_emb = None
-        if self.use_cross_attention:
-            if self.task == "classification":
-                pred_idx = logits.argmax(dim=-1)  # (batch_size,)
-                pred_emb = self.pred_embedding(pred_idx)  # (batch_size, d_model)
-            else:
-                pred_emb = self.pred_embedding(logits)  # (batch_size, d_model)
-
-            # Expand to sequence length for cross-attention
-            pred_emb = pred_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (batch_size, seq_len, d_model)
-
-        return logits, pred_emb
-
-
-# --- Hierarchical Transformer ---
-class HierarchicalTransformer(nn.Module):
-    """Flexible Transformer for molecular property prediction with attachment points.
-
-    Architecture:
-        1. Token + positional embeddings
-        2. Stack of N encoder blocks (configurable)
-        3. Prediction heads attached to specific encoder blocks:
-           - Multiple heads can attach to the same block
-           - Heads can attach to any block (0 to N-1)
-           - Each head optionally embeds prediction for cross-attention feedback
-        4. Optional cross-attention from prediction embeddings to subsequent blocks
-
-    Example configurations:
-        - Default: N=4 blocks, 1 head attached to block 3 (last)
-        - Parallel: N=2 blocks, 7 heads attached to block 1 (all parallel)
-        - Hierarchical: Head1@block0 (cross-attn) → Head2@block1 (cross-attn) → Head3@block2
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        property_configs: List[Dict],
-        n_encoder_blocks: int = 4,
-        max_len: int = 512,
-        d_model: int = 512,
-        nhead: int = 8,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        pad_idx: int = 0
-    ):
-        """Initialize flexible transformer.
-
-        Args:
-            vocab_size: Size of token vocabulary
-            property_configs: List of dicts with property configurations:
-                [
-                    {
-                        "name": "dimension",
-                        "task": "classification",
-                        "num_classes": 5,
-                        "attach_at_block": 3,  # Attach head to block 3 output
-                        "use_cross_attention": True  # Embed prediction and feed back
-                    },
-                    {
-                        "name": "ring_count",
-                        "task": "classification",
-                        "num_classes": 7,
-                        "attach_at_block": 3,  # Attach to same block as dimension
-                        "use_cross_attention": False
-                    },
-                    ...
-                ]
-            n_encoder_blocks: Total number of encoder blocks in stack
-            max_len: Maximum sequence length
-            d_model: Model dimension
-            nhead: Number of attention heads
-            dim_feedforward: FFN dimension
-            dropout: Dropout probability
-            pad_idx: Padding token index
-        """
-        super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.n_encoder_blocks = n_encoder_blocks
-
-        # Validate n_encoder_blocks
-        if n_encoder_blocks < 1:
-            raise ValueError(f"n_encoder_blocks must be >= 1, got {n_encoder_blocks}")
-
-        # Token embeddings
-        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.pos_enc = LearnedPositionalEncoding(d_model, max_len)
-
-        # Create stack of encoder blocks (individual layers for flexible attachment)
-        self.encoder_blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model, nhead, dim_feedforward, dropout, batch_first=True
-            )
-            for _ in range(n_encoder_blocks)
-        ])
-
-        # Create cross-attention modules for each encoder block (except first)
-        self.cross_attn_modules = nn.ModuleList([
-            CrossAttention(d_model, nhead, dropout) if i > 0 else None
-            for i in range(n_encoder_blocks)
-        ])
-
-        # Create property heads
-        self.property_heads = nn.ModuleDict()
-        self.property_configs = {}
-
-        for cfg in property_configs:
-            prop_name = cfg["name"]
-            self.property_configs[prop_name] = cfg
-
-            self.property_heads[prop_name] = PropertyHead(
-                d_model=d_model,
-                task=cfg["task"],
-                num_classes=cfg.get("num_classes"),
-                use_cross_attention=cfg.get("use_cross_attention", False)
-            )
-
-        # Group properties by attachment block for efficient processing
-        self.attachment_map = {}  # block_idx -> [property_names]
-        for cfg in property_configs:
-            attach_block = cfg.get("attach_at_block", n_encoder_blocks - 1)
-
-            # Validate attachment block is within valid range
-            if attach_block < 0 or attach_block >= n_encoder_blocks:
-                raise ValueError(
-                    f"Property '{cfg['name']}' has attach_at_block={attach_block}, "
-                    f"but must be in range [0, {n_encoder_blocks - 1}]"
-                )
-
-            if attach_block not in self.attachment_map:
-                self.attachment_map[attach_block] = []
-            self.attachment_map[attach_block].append(cfg["name"])
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Forward pass through encoder stack with head attachments.
-
-        Args:
-            input_ids: Token IDs (batch_size, seq_len)
-            attention_mask: Attention mask (batch_size, seq_len) where 1=valid, 0=padding
-
-        Returns:
-            Dictionary of predictions for each property (keyed by property name)
-        """
-        # Embed tokens and add positional encoding
-        x = self.token_emb(input_ids)
-        x = self.pos_enc(x)
-
-        # Track outputs and cross-attention memories
-        outputs = {}
-        cross_attn_memories = []  # List of (pred_embedding, mask) tuples for cross-attention
-
-        # Process encoder blocks sequentially
-        for block_idx, encoder_block in enumerate(self.encoder_blocks):
-
-            # Apply cross-attention from prediction embeddings generated so far
-            if block_idx > 0 and len(cross_attn_memories) > 0 and self.cross_attn_modules[block_idx] is not None:
-                # Concatenate all prediction embeddings along sequence dimension
-                # Each pred_emb has shape (batch, seq_len, d_model)
-                all_memories = torch.cat([mem for mem, _ in cross_attn_memories], dim=1)
-                # All masks have shape (batch, seq_len) - concatenate to (batch, n_preds * seq_len)
-                all_masks = torch.cat([mask for _, mask in cross_attn_memories], dim=1)
-
-                # Cross-attend from current representation to all previous predictions
-                x = self.cross_attn_modules[block_idx](
-                    x,
-                    all_memories,
-                    memory_mask=~all_masks.bool()  # CrossAttention expects True for positions to mask out
-                )
-
-            # Process through encoder block (self-attention + FFN)
-            x = encoder_block(x, src_key_padding_mask=~attention_mask.bool())
-
-            # Apply any prediction heads attached at this block
-            if block_idx in self.attachment_map:
-                for prop_name in self.attachment_map[block_idx]:
-                    # Generate prediction for this property
-                    logits, pred_emb = self.property_heads[prop_name](x)
-                    outputs[prop_name] = logits
-
-                    # Store prediction embedding for cross-attention to future blocks (if enabled)
-                    if pred_emb is not None:
-                        cross_attn_memories.append((pred_emb, attention_mask))
-
-        return outputs
-
-
-# --- Training & Evaluation ---
-def train_one_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    property_configs: List[Dict],
-    bf16: bool = True
-) -> float:
-    """Train for one epoch.
-
-    Args:
-        model: Model to train
-        dataloader: Training data loader
-        optimizer: Optimizer
-        device: Device to train on
-        property_configs: List of property configurations with 'name' and 'task' keys
-        bf16: Whether to use bfloat16 autocast
-
-    Returns:
-        Average training loss
-    """
-    model.train()
-    epoch_loss = 0.0
-
-    # Build loss functions for each property
-    loss_functions = {}
-    for prop_cfg in property_configs:
-        if prop_cfg["task"] == "classification":
-            loss_functions[prop_cfg["name"]] = nn.CrossEntropyLoss()
-        else:
-            loss_functions[prop_cfg["name"]] = nn.MSELoss()
-
-    for batch_inputs, batch_masks, batch_targets in dataloader:
-        batch_inputs = batch_inputs.to(device)
-        batch_masks = batch_masks.to(device)
-        batch_targets = {k: v.to(device) for k, v in batch_targets.items()}
-
-        optimizer.zero_grad()
-
-        autocast_ctx = (
-            torch.autocast("cuda", dtype=torch.bfloat16)
-            if bf16 else torch.autocast("cuda", enabled=False)
-        )
-
-        with autocast_ctx:
-            batch_outputs = model(batch_inputs, batch_masks)
-            batch_loss = 0.0
-
-            # Accumulate loss for each property
-            for prop_cfg in property_configs:
-                prop_name = prop_cfg["name"]
-                if prop_name not in batch_outputs:
-                    continue
-
-                prop_target = batch_targets[prop_name]
-                prop_pred = batch_outputs[prop_name]
-
-                if prop_cfg["task"] == "classification":
-                    batch_loss += loss_functions[prop_name](prop_pred, prop_target.long())
-                else:
-                    batch_loss += loss_functions[prop_name](prop_pred.squeeze(-1), prop_target.float())
-
-        batch_loss.backward()
-        optimizer.step()
-        epoch_loss += batch_loss.item() * batch_inputs.size(0)
-
-    return epoch_loss / len(dataloader.dataset)
-
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    property_configs: List[Dict],
-    bf16: bool = False
-) -> Tuple[float, float]:
-    """Evaluate model.
-
-    Args:
-        model: Model to evaluate
-        dataloader: Validation/test data loader
-        device: Device to evaluate on
-        property_configs: List of property configurations with 'name' and 'task' keys
-        bf16: Whether to use bfloat16 autocast
-
-    Returns:
-        Tuple of (MSE, RMSE)
-    """
-    model.eval()
-    eval_loss = 0.0
-
-    # Build loss functions for each property
-    loss_functions = {}
-    for prop_cfg in property_configs:
-        if prop_cfg["task"] == "classification":
-            loss_functions[prop_cfg["name"]] = nn.CrossEntropyLoss()
-        else:
-            loss_functions[prop_cfg["name"]] = nn.MSELoss()
-
-    with torch.no_grad():
-        autocast_ctx = (
-            torch.autocast("cuda", dtype=torch.bfloat16)
-            if bf16 else torch.autocast("cuda", enabled=False)
-        )
-
-        with autocast_ctx:
-            for batch_inputs, batch_masks, batch_targets in dataloader:
-                batch_inputs = batch_inputs.to(device)
-                batch_masks = batch_masks.to(device)
-                batch_targets = {k: v.to(device) for k, v in batch_targets.items()}
-
-                batch_outputs = model(batch_inputs, batch_masks)
-                batch_loss = 0.0
-
-                # Accumulate loss for each property
-                for prop_cfg in property_configs:
-                    prop_name = prop_cfg["name"]
-                    if prop_name not in batch_outputs:
-                        continue
-
-                    prop_target = batch_targets[prop_name]
-                    prop_pred = batch_outputs[prop_name]
-
-                    if prop_cfg["task"] == "classification":
-                        batch_loss += loss_functions[prop_name](prop_pred, prop_target.long())
-                    else:
-                        batch_loss += loss_functions[prop_name](prop_pred.squeeze(-1), prop_target.float())
-
-                eval_loss += batch_loss.item() * batch_inputs.size(0)
-
-    mse = eval_loss / len(dataloader.dataset)
-    rmse = mse ** 0.5
-    return mse, rmse
-
 
 # --- Main Training Script ---
 def main():
@@ -917,7 +58,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-4,
+        help="Learning rate (base: 1e-4 for batch_size=64; scale with: lr * (batch_size/64) / sqrt(n_encoder_blocks))")
     parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
     parser.add_argument("--n_encoder_blocks", type=int, default=4, help="Number of encoder blocks in the stack")
     parser.add_argument("--mode", choices=["smiles", "selfies"], default="smiles", help="Input format")
@@ -951,6 +93,104 @@ def main():
         type=int,
         default=None,
         help="Maximum number of molecules to load (default: None = all molecules)"
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=["none", "onecycle", "plateau"],
+        default="none",
+        help="Learning rate scheduler: none (constant), onecycle (warmup+cosine), plateau (adaptive)"
+    )
+    parser.add_argument(
+        "--warmup_pct",
+        type=float,
+        default=0.1,
+        help="Warmup percentage for onecycle scheduler (default: 0.1 = 10%%)"
+    )
+    parser.add_argument(
+        "--loss_fn",
+        choices=["crossentropy", "focal"],
+        default="crossentropy",
+        help="Loss function for classification: crossentropy (standard) or focal (for imbalanced data)"
+    )
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focal loss gamma parameter (focusing on hard examples, default: 2.0)"
+    )
+    parser.add_argument(
+        "--focal_alpha",
+        type=str,
+        default="auto",
+        choices=["auto", "none"],
+        help="Focal loss alpha (class weights): 'auto' uses computed class weights, 'none' uses uniform weights"
+    )
+    parser.add_argument(
+        "--task_loss_weights",
+        type=str,
+        default="",
+        help="Per-task loss weights for multi-task balancing (space-separated property:weight pairs, e.g., 'dimension:2.0 chirality:1.5'). Empty = uniform weights (1.0 for all)"
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=".",
+        help="Directory to save best_model.pt and test outputs (default: current directory)"
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=10,
+        help="Stop if no improvement in validation metric for N epochs (0=disable, default: 10)"
+    )
+    parser.add_argument(
+        "--early_stop_overfit_patience",
+        type=int,
+        default=5,
+        help="Stop if overfitting detected for N consecutive epochs (0=disable, default: 5)"
+    )
+    parser.add_argument(
+        "--early_stop_warmup",
+        type=int,
+        default=5,
+        help="Number of initial epochs to check for training instability (default: 5)"
+    )
+    parser.add_argument(
+        "--early_stop_instability_threshold",
+        type=float,
+        default=7.0,
+        help="Stop if loss change exceeds N× standard deviation in warmup period (default: 7.0)"
+    )
+    parser.add_argument(
+        "--onecycle_div_factor",
+        type=float,
+        default=10.0,
+        help="OneCycleLR initial LR divisor: initial_lr = max_lr / div_factor (default: 10.0)"
+    )
+    parser.add_argument(
+        "--onecycle_final_div_factor",
+        type=float,
+        default=100.0,
+        help="OneCycleLR final LR divisor: final_lr = max_lr / final_div_factor (default: 100.0)"
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to checkpoint file (best_model.pt) to resume training from (default: None = train from scratch)"
+    )
+    parser.add_argument(
+        "--additional_epochs",
+        type=int,
+        default=None,
+        help="Number of additional epochs to train when resuming (default: None = use --epochs as total)"
+    )
+    parser.add_argument(
+        "--onecycle_resume_mode",
+        type=str,
+        default="restart",
+        choices=["continue", "restart"],
+        help="OneCycleLR resume behavior: 'continue' = preserve exact schedule state, 'restart' = create new schedule for remaining epochs (default: restart)"
     )
     args = parser.parse_args()
 
@@ -1031,9 +271,13 @@ def main():
     nval = int(0.1 * n)
     train_ds, val_ds, test_ds = random_split(dataset, [ntrain, nval, n - ntrain - nval])
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    # Optimized DataLoader with pin_memory and multiple workers for faster data transfer to GPU
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
+                             num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn,
+                           num_workers=2, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn,
+                            num_workers=2, pin_memory=True)
 
     print(f"Dataset: {ntrain} train, {nval} val, {n - ntrain - nval} test")
 
@@ -1060,10 +304,12 @@ def main():
             "num_classes": label_encoder.get_num_classes("point_group")
         },
         "planar_fit_error": {
-            "task": "regression"
+            "task": "sequence_regression",
+            "max_seq_len": 15  # Max for 15 rings: one error per ring
         },
         "ring_plane_angles": {
-            "task": "regression"
+            "task": "sequence_regression",
+            "max_seq_len": 105  # Max for 15 rings: 15*14/2 = 105 angles
         }
     }
 
@@ -1133,40 +379,498 @@ def main():
         pad_idx=tokenizer.token_to_id["<pad>"]
     )
     model.to(device)
-    
+
+    # Store loss function configuration in model for later use
+    model.loss_fn_type = args.loss_fn
+    model.focal_gamma = args.focal_gamma if args.loss_fn == "focal" else None
+
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    best_val_rmse = float("inf")
+    # Apply learning rate scaling formula: LR = (base_lr * batch_size / 64) / sqrt(n_encoder_blocks)
+    # This scales LR based on batch size and model depth for optimal training
+    import math
+    batch_scale = args.batch_size / 64
+    depth_scale = 1.0 / math.sqrt(args.n_encoder_blocks)
+    scaled_lr = args.lr * batch_scale * depth_scale
+
+    print(f"\nLearning rate configuration:")
+    print(f"  Base LR (--lr): {args.lr:.6e}")
+    print(f"  Batch size: {args.batch_size} (scale factor: {batch_scale:.2f}×)")
+    print(f"  Encoder blocks: {args.n_encoder_blocks} (depth scale: {depth_scale:.4f}×)")
+    print(f"  Final scaled LR: {scaled_lr:.6e}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr)
+
+    # Resume from checkpoint if specified
+    start_epoch = 1
+    best_val_metric_init = float('inf') if len(property_configs) == 1 and property_configs[0]["task"] == "regression" else 0.0
+
+    if args.resume_from is not None:
+        import os
+        if not os.path.exists(args.resume_from):
+            raise FileNotFoundError(f"Checkpoint file not found: {args.resume_from}")
+
+        print(f"\nLoading checkpoint from: {args.resume_from}")
+        checkpoint = torch.load(args.resume_from, map_location=device)
+
+        # Validate checkpoint compatibility
+        if checkpoint["vocab_size"] != tokenizer.vocab_size:
+            raise ValueError(f"Vocab size mismatch: checkpoint={checkpoint['vocab_size']}, current={tokenizer.vocab_size}")
+        if checkpoint["n_encoder_blocks"] != args.n_encoder_blocks:
+            raise ValueError(f"Encoder blocks mismatch: checkpoint={checkpoint['n_encoder_blocks']}, current={args.n_encoder_blocks}")
+        if checkpoint["d_model"] != args.d_model:
+            raise ValueError(f"Model dimension mismatch: checkpoint={checkpoint['d_model']}, current={args.d_model}")
+
+        # Load model state
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load optimizer state if available (backward compatibility)
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print(f"  Loaded optimizer state")
+        else:
+            print(f"  Warning: Old checkpoint format detected (no optimizer state), starting optimizer from scratch")
+
+        # Get epoch information (backward compatibility)
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1
+            print(f"  Checkpoint was saved at epoch {checkpoint['epoch']}")
+        else:
+            print(f"  Warning: Old checkpoint format detected (no epoch info), assuming epoch 0")
+            start_epoch = 1
+
+        best_val_metric_init = checkpoint.get("best_val_metric", best_val_metric_init)
+
+        # Update learning rate if user provided a different one
+        if args.lr != checkpoint["training_args"]["base_lr"]:
+            print(f"  Warning: Overriding checkpoint LR {checkpoint['training_args']['scaled_lr']:.6e} with new scaled LR {scaled_lr:.6e}")
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = scaled_lr
+
+        # Determine total epochs
+        if args.additional_epochs is not None:
+            total_epochs = start_epoch - 1 + args.additional_epochs
+            print(f"  Resuming from epoch {start_epoch} (completed {start_epoch - 1} epochs)")
+            print(f"  Training for {args.additional_epochs} additional epochs (total: {total_epochs} epochs)")
+        else:
+            total_epochs = args.epochs
+            remaining_epochs = total_epochs - (start_epoch - 1)
+            print(f"  Resuming from epoch {start_epoch} (completed {start_epoch - 1} epochs)")
+            print(f"  Training until epoch {total_epochs} ({remaining_epochs} remaining epochs)")
+
+        # Update args.epochs to reflect total training epochs
+        args.epochs = total_epochs
+
+        print(f"  Best validation metric from checkpoint: {best_val_metric_init:.4f}")
+        print(f"  Loaded optimizer state and model weights")
+    else:
+        print("\nTraining from scratch")
+
+    # Determine best model selection criterion
+    # For single property training, use task-appropriate metric
+    # For multiple properties, use weighted average
+    if len(property_configs) == 1:
+        prop_cfg = property_configs[0]
+        if prop_cfg["task"] == "classification":
+            num_classes = prop_cfg["num_classes"]
+            if num_classes == 2:
+                # Binary: maximize AUPRC
+                best_val_metric = best_val_metric_init if args.resume_from else 0.0
+                best_metric_name = "val_AUPRC"
+                maximize_metric = True
+            else:
+                # Multi-class: maximize macro_F1
+                best_val_metric = best_val_metric_init if args.resume_from else 0.0
+                best_metric_name = "val_macro_F1"
+                maximize_metric = True
+        else:
+            # Regression: minimize RMSE
+            best_val_metric = best_val_metric_init if args.resume_from else float("inf")
+            best_metric_name = "val_RMSE"
+            maximize_metric = False
+    else:
+        # Multiple properties: use RMSE for now (backward compatible)
+        best_val_metric = best_val_metric_init if args.resume_from else float("inf")
+        best_metric_name = "val_RMSE"
+        maximize_metric = False
+
+    # Compute class weights for imbalanced classification tasks
+    print(f"\nComputing class weights for imbalanced classification (loss_fn: {args.loss_fn})...")
+    class_weights = {}
+    for prop_cfg in property_configs:
+        if prop_cfg["task"] == "classification":
+            prop_name = prop_cfg["name"]
+            num_classes = prop_cfg["num_classes"]
+
+            # Compute weights if using with loss function
+            if args.loss_fn == "focal" and args.focal_alpha == "none":
+                # Focal loss without alpha (uniform weights)
+                print(f"  {prop_name}: Using focal loss with gamma={args.focal_gamma}, no class weights")
+            else:
+                # Compute class weights for CrossEntropyLoss or Focal Loss with alpha
+                weights = compute_class_weights(train_loader, prop_name, num_classes, device)
+                class_weights[prop_name] = weights
+                if args.loss_fn == "focal":
+                    print(f"  {prop_name}: Using focal loss with gamma={args.focal_gamma}, alpha weights: min={weights.min():.4f}, max={weights.max():.4f}, ratio={weights.max()/weights.min():.1f}:1")
+                else:
+                    print(f"  {prop_name}: Using CrossEntropyLoss with weights: min={weights.min():.4f}, max={weights.max():.4f}, ratio={weights.max()/weights.min():.1f}:1")
+
+    # Parse task-level loss weights for multi-task balancing
+    task_loss_weights = {}
+    if args.task_loss_weights:
+        print(f"\nParsing task-level loss weights for multi-task balancing...")
+        for pair in args.task_loss_weights.split():
+            prop_name, weight_str = pair.split(":")
+            task_loss_weights[prop_name] = float(weight_str)
+            print(f"  {prop_name}: weight={float(weight_str):.2f}")
+        print(f"  Total expected weighted loss (estimated): ~{sum(task_loss_weights.values()) * 0.14:.2f}")
+    else:
+        task_loss_weights = None
+
+    # Create learning rate scheduler
+    scheduler = None
+    if args.scheduler == "onecycle":
+        from torch.optim.lr_scheduler import OneCycleLR
+
+        # Determine epochs for OneCycleLR scheduler
+        # If resuming with restart mode, use remaining epochs; otherwise use total epochs
+        if args.resume_from is not None and args.onecycle_resume_mode == "restart":
+            # Restart mode: create new schedule for remaining epochs only
+            scheduler_epochs = args.epochs - start_epoch
+            print(f"\nOneCycleLR restart mode: Creating new schedule for {scheduler_epochs} remaining epochs")
+        else:
+            # Continue mode or training from scratch: use total epochs
+            scheduler_epochs = args.epochs
+
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=scaled_lr,
+            epochs=scheduler_epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=args.warmup_pct,
+            anneal_strategy='cos',
+            div_factor=args.onecycle_div_factor,
+            final_div_factor=args.onecycle_final_div_factor
+        )
+        print(f"\nUsing OneCycleLR scheduler:")
+        print(f"  Warmup: {args.warmup_pct*100:.0f}% of training")
+        print(f"  Max LR: {scaled_lr:.2e}")
+        print(f"  Initial LR: {scaled_lr/args.onecycle_div_factor:.2e}")
+        print(f"  Final LR: {scaled_lr/args.onecycle_final_div_factor:.2e}")
+        print(f"  Div factors: initial={args.onecycle_div_factor}, final={args.onecycle_final_div_factor}")
+    elif args.scheduler == "plateau":
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+        # Use correct mode based on metric direction
+        plateau_mode = 'max' if maximize_metric else 'min'
+
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode=plateau_mode,
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=True
+        )
+        print(f"\nUsing ReduceLROnPlateau scheduler:")
+        print(f"  Mode: '{plateau_mode}' ({'higher is better' if maximize_metric else 'lower is better'})")
+        print(f"  Factor: 0.5 (halve LR on plateau)")
+        print(f"  Patience: 3 epochs")
+        print(f"  Min LR: 1e-6")
+
+        # Warn if early stopping patience is too low
+        if args.early_stop_patience > 0 and args.early_stop_patience < 15:
+            print(f"  ⚠️  WARNING: early_stop_patience={args.early_stop_patience} may be too low for plateau scheduler")
+            print(f"      Plateau scheduler needs time to reduce LR and see improvement")
+            print(f"      Recommended: --early_stop_patience 15 or higher")
+    else:
+        print(f"\nUsing constant learning rate: {scaled_lr:.2e}")
+
+    # Load scheduler state if resuming and scheduler was used in checkpoint
+    if args.resume_from is not None and scheduler is not None:
+        # Only load scheduler state in "continue" mode for OneCycleLR
+        if args.scheduler == "onecycle" and args.onecycle_resume_mode == "restart":
+            print(f"  OneCycleLR restart mode: Starting fresh scheduler (not loading checkpoint state)")
+        elif "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            print(f"  Loaded scheduler state from checkpoint")
+        else:
+            print(f"  Warning: Checkpoint has no scheduler state, starting scheduler from scratch")
+
+    # Initialize early stopping monitor
+    early_stopping = EarlyStoppingMonitor(
+        patience=args.early_stop_patience,
+        overfit_patience=args.early_stop_overfit_patience,
+        warmup_epochs=args.early_stop_warmup,
+        instability_threshold=args.early_stop_instability_threshold,
+        maximize_metric=maximize_metric,
+        min_delta=1e-4
+    )
+
+    print(f"\nEarly stopping configuration:")
+    print(f"  Plateau patience: {args.early_stop_patience} epochs (0=disabled)")
+    print(f"  Overfit patience: {args.early_stop_overfit_patience} epochs (0=disabled)")
+    print(f"  Warmup period: {args.early_stop_warmup} epochs (instability checks)")
+    print(f"  Instability threshold: {args.early_stop_instability_threshold}× std deviation")
 
     print("\nStarting training...")
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, property_configs, bf16=True)
-        val_mse, val_rmse = evaluate(model, val_loader, device, property_configs, bf16=True)
+    for epoch in range(start_epoch, args.epochs + 1):
+        # Training with per-property loss tracking
+        # Pass scheduler for OneCycleLR (steps per batch), class weights, and task loss weights
+        train_loss, train_property_losses, is_healthy = train_one_epoch(
+            model, train_loader, optimizer, device, property_configs, bf16=True,
+            scheduler=scheduler if args.scheduler == "onecycle" else None,
+            class_weights=class_weights,
+            task_loss_weights=task_loss_weights
+        )
 
-        print(f"Epoch {epoch:3d} | Train loss: {train_loss:.4f} | Val RMSE: {val_rmse:.4f}")
+        # Check training health (NaN/Inf detection)
+        if not is_healthy:
+            print("\n" + "="*70)
+            print("TRAINING STOPPED: NaN/Inf detected in losses or gradients")
+            print("="*70)
+            print("This indicates severe numerical instability.")
+            print("Recommendations:")
+            print("  1. Reduce learning rate by 5-10×")
+            print("  2. Enable gradient clipping (torch.nn.utils.clip_grad_norm_)")
+            print("  3. Check for data quality issues (corrupted samples)")
+            print("  4. Consider using mixed precision training with loss scaling")
+            break
+
+        # Evaluation with comprehensive metrics, class weights, and task loss weights
+        val_mse, val_rmse, val_property_metrics = evaluate(
+            model, val_loader, device, property_configs, bf16=True,
+            class_weights=class_weights,
+            compute_confusion=False,  # Don't compute confusion during training (saves time)
+            task_loss_weights=task_loss_weights
+        )
+
+        # Print epoch summary with current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Check if any property is regression to determine if RMSE should be shown
+        has_regression = any(prop_cfg["task"] == "regression" for prop_cfg in property_configs)
+
+        if has_regression:
+            print(f"\nEpoch {epoch:3d} | Train loss: {train_loss:.4f} | Val RMSE: {val_rmse:.4f} | LR: {current_lr:.2e}")
+        else:
+            print(f"\nEpoch {epoch:3d} | Train loss: {train_loss:.4f} | LR: {current_lr:.2e}")
+
+        # Print per-property training losses
+        print("  Training losses per property:")
+        for prop_name, loss_val in train_property_losses.items():
+            print(f"    {prop_name:20s}: {loss_val:.4f}")
+
+        # Print per-property validation metrics
+        print("  Validation metrics per property:")
+        for prop_name, metrics in val_property_metrics.items():
+            # Find task type
+            task = None
+            num_classes = None
+            for prop_cfg in property_configs:
+                if prop_cfg["name"] == prop_name:
+                    task = prop_cfg["task"]
+                    num_classes = prop_cfg.get("num_classes", None)
+                    break
+
+            if task == "classification":
+                # Show comprehensive classification metrics
+                if num_classes == 2:
+                    # Binary: show AUPRC, macro_F1
+                    print(f"    {prop_name:20s}: AUPRC={metrics.get('auprc', 0):.4f}, macro_F1={metrics.get('macro_f1', 0):.4f}, acc={metrics['accuracy']:.2f}%")
+                else:
+                    # Multi-class: show macro_F1, weighted_F1, macro_recall
+                    print(f"    {prop_name:20s}: macro_F1={metrics.get('macro_f1', 0):.4f}, w_F1={metrics.get('weighted_f1', 0):.4f}, m_recall={metrics.get('macro_recall', 0):.4f}, acc={metrics['accuracy']:.2f}%")
+            else:  # regression
+                print(f"    {prop_name:20s}: rmse={metrics['rmse']:.4f}, mae={metrics['mae']:.4f}")
+
+        # Get current validation metric for model selection
+        if len(property_configs) == 1:
+            prop_name = property_configs[0]["name"]
+            if property_configs[0]["task"] == "classification":
+                num_classes = property_configs[0]["num_classes"]
+                if num_classes == 2:
+                    current_val_metric = val_property_metrics[prop_name].get("auprc", 0.0)
+                else:
+                    current_val_metric = val_property_metrics[prop_name].get("macro_f1", 0.0)
+            else:
+                current_val_metric = val_rmse
+        else:
+            current_val_metric = val_rmse
+
+        # Step ReduceLROnPlateau scheduler (steps per epoch based on validation metric)
+        if scheduler is not None and args.scheduler == "plateau":
+            scheduler.step(current_val_metric)
+
+        # Check early stopping conditions
+        should_stop = early_stopping.update(epoch, train_loss, current_val_metric)
+        if should_stop:
+            print("\n" + "="*70)
+            print("EARLY STOPPING TRIGGERED")
+            print("="*70)
+            print(early_stopping.stop_reason)
+            print("="*70)
+            break
 
         # Save best model
-        if val_rmse < best_val_rmse:
-            best_val_rmse = val_rmse
-            torch.save({
+        is_best = (current_val_metric > best_val_metric) if maximize_metric else (current_val_metric < best_val_metric)
+        if is_best:
+            best_val_metric = current_val_metric
+            checkpoint = {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+                "best_val_metric": best_val_metric,
                 "property_configs": property_configs,
                 "vocab_size": tokenizer.vocab_size,
                 "max_len": args.max_len,
                 "d_model": args.d_model,
                 "n_encoder_blocks": args.n_encoder_blocks,
                 "label_encoder": label_encoder,
-            }, "best_model.pt")
-            print(f"  -> Saved best model (val RMSE: {val_rmse:.4f})")
+                "class_weights": class_weights,  # Save class weights for reproducibility
+                "val_property_metrics": val_property_metrics,
+                "scheduler_type": args.scheduler,
+                "training_args": {
+                    "base_lr": args.lr,
+                    "scaled_lr": scaled_lr,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "warmup_pct": args.warmup_pct,
+                    "n_encoder_blocks": args.n_encoder_blocks,
+                }
+            }
+            if scheduler is not None:
+                checkpoint["scheduler_state_dict"] = scheduler.state_dict()
 
-    # Final test evaluation
-    test_mse, test_rmse = evaluate(model, test_loader, device, property_configs, bf16=True)
-    print(f"\nTest RMSE: {test_rmse:.4f} (MSE {test_mse:.6f})")
-    print(f"Best validation RMSE: {best_val_rmse:.4f}")
+            # Save to specified directory (creates directory if needed)
+            import os
+            os.makedirs(args.save_dir, exist_ok=True)
+            model_path = os.path.join(args.save_dir, "best_model.pt")
+            torch.save(checkpoint, model_path)
+            print(f"  -> Saved best model to {model_path} ({best_metric_name}: {current_val_metric:.4f})")
+
+        # Save periodic checkpoint (last_checkpoint.pt) after every epoch
+        # Allows resuming from exact point if job terminates early (e.g., 24h SLURM limit)
+        last_checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val_metric": best_val_metric,
+            "property_configs": property_configs,
+            "vocab_size": tokenizer.vocab_size,
+            "max_len": args.max_len,
+            "d_model": args.d_model,
+            "n_encoder_blocks": args.n_encoder_blocks,
+            "label_encoder": label_encoder,
+            "class_weights": class_weights,
+            "val_property_metrics": val_property_metrics,
+            "scheduler_type": args.scheduler,
+            "training_args": {
+                "base_lr": args.lr,
+                "scaled_lr": scaled_lr,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "warmup_pct": args.warmup_pct,
+                "n_encoder_blocks": args.n_encoder_blocks,
+            }
+        }
+        if scheduler is not None:
+            last_checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+
+        os.makedirs(args.save_dir, exist_ok=True)
+        last_checkpoint_path = os.path.join(args.save_dir, "last_checkpoint.pt")
+        torch.save(last_checkpoint, last_checkpoint_path)
+
+    # Final test evaluation with confusion matrices
+    test_mse, test_rmse, test_property_metrics = evaluate(
+        model, test_loader, device, property_configs, bf16=True,
+        class_weights=class_weights,
+        compute_confusion=True,  # Compute confusion matrices for test set
+        task_loss_weights=task_loss_weights
+    )
+
+    print(f"\n{'='*70}")
+    print(f"FINAL TEST RESULTS")
+    print(f"{'='*70}")
+
+    # Only show overall RMSE if there are regression tasks
+    has_regression = any(prop_cfg["task"] == "regression" for prop_cfg in property_configs)
+    if has_regression:
+        print(f"Overall Test RMSE: {test_rmse:.4f} (MSE {test_mse:.6f})")
+
+    print(f"\nPer-property test metrics:")
+    for prop_name, metrics in test_property_metrics.items():
+        # Find task type
+        task = None
+        num_classes = None
+        for prop_cfg in property_configs:
+            if prop_cfg["name"] == prop_name:
+                task = prop_cfg["task"]
+                num_classes = prop_cfg.get("num_classes", None)
+                break
+
+        if task == "classification":
+            # Show comprehensive test metrics
+            if num_classes == 2:
+                # Binary classification
+                print(f"  {prop_name:20s}: AUPRC={metrics.get('auprc', 0):.4f}, macro_F1={metrics.get('macro_f1', 0):.4f}, acc={metrics['accuracy']:.2f}%")
+            else:
+                # Multi-class
+                print(f"  {prop_name:20s}: macro_F1={metrics.get('macro_f1', 0):.4f}, w_F1={metrics.get('weighted_f1', 0):.4f}, m_recall={metrics.get('macro_recall', 0):.4f}, acc={metrics['accuracy']:.2f}%")
+
+            # Print confusion matrix and per-class metrics if available
+            if "confusion_matrix" in metrics:
+                print(f"\n  Confusion Matrix for {prop_name}:")
+                cm = metrics["confusion_matrix"]
+                print(f"    Shape: {cm.shape} (true × pred)")
+                print(f"    Confusion matrix saved in test_property_metrics")
+
+                if "per_class_metrics" in metrics:
+                    print(f"\n  Per-class metrics for {prop_name}:")
+                    print(f"    {'Class':<8} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Support':<10}")
+                    print(f"    {'-'*60}")
+                    for class_idx, class_metrics in metrics["per_class_metrics"].items():
+                        print(f"    {class_idx:<8} {class_metrics['precision']:<12.4f} {class_metrics['recall']:<12.4f} {class_metrics['f1']:<12.4f} {int(class_metrics['support']):<10}")
+                print()  # Extra newline for readability
+        else:  # regression
+            print(f"  {prop_name:20s}: rmse={metrics['rmse']:.4f}, mae={metrics['mae']:.4f}")
+
+    # Save comprehensive test metrics to JSON (without confusion matrix - too large)
+    test_metrics_summary = {}
+    for prop_name, metrics in test_property_metrics.items():
+        # Remove numpy arrays and non-JSON-serializable objects
+        test_metrics_summary[prop_name] = {
+            k: float(v) if isinstance(v, (np.floating, np.integer)) else v
+            for k, v in metrics.items()
+            if k not in ["confusion_matrix", "per_class_metrics", "all_predictions", "all_targets", "all_probabilities"]
+        }
+
+    import os
+    test_metrics_path = os.path.join(args.save_dir, "test_metrics.json")
+    with open(test_metrics_path, "w") as f:
+        json.dump(test_metrics_summary, f, indent=2)
+    print(f"\nTest metrics summary saved to: {test_metrics_path}")
+
+    # Save confusion matrices and detailed per-class metrics to pickle
+    if any("confusion_matrix" in m for m in test_property_metrics.values()):
+        import pickle
+        confusion_path = os.path.join(args.save_dir, "test_confusion_matrices.pkl")
+        with open(confusion_path, "wb") as f:
+            pickle.dump(test_property_metrics, f)
+        print(f"Confusion matrices and per-class metrics saved to: {confusion_path}")
+        print(f"Load with: import pickle; metrics = pickle.load(open('{confusion_path}', 'rb'))")
+
+    print(f"\nBest validation {best_metric_name}: {best_val_metric:.4f}")
     print("Training complete!")
+
+    # Clean up periodic checkpoint after successful completion
+    # last_checkpoint.pt is only needed for resuming interrupted training
+    last_checkpoint_path = os.path.join(args.save_dir, "last_checkpoint.pt")
+    if os.path.exists(last_checkpoint_path):
+        os.remove(last_checkpoint_path)
+        print(f"Removed temporary checkpoint: {last_checkpoint_path}")
 
 
 if __name__ == "__main__":
